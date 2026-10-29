@@ -1,0 +1,194 @@
+name: storytold-mcp - check upstream versions & rebuild
+# Run title in the Actions list: scheduled/manual runs would otherwise show
+# whatever commit is latest on main. Empty (push) = Gitea's default subject.
+run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.event_name == 'workflow_dispatch' && 'Manual run' || '' }}
+
+on:
+  schedule:
+    # every 3 hours -- the deb-repos index itself is rebuilt every 3 hours
+    - cron: '30 */3 * * *'
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      # Only what goes into (or gates) the image -- not the README,
+      # .env.sample or the version file (CI's own bump commit would
+      # otherwise trigger a second, identical rebuild).
+      - storytold-mcp/docker/**
+      - .gitea/workflows/storytold-mcp-rebuild.yml
+
+env:
+  STORYTOLD_REPO: https://linuxrrze.github.io/deb-repos/storytold
+  REGISTRY: git.linux-ng.de
+  IMAGE: git.linux-ng.de/marcel/storytold-mcp
+  # Sorted `<package>=<version>` lines: every storytold app + mcp-proxy.
+  VERSION_FILE: storytold-mcp/.storytold-mcp-version
+  # Digest of the Dockerfile's base image (ubuntu:26.04) the last build used.
+  BASE_DIGEST_FILE: storytold-mcp/.storytold-mcp-base-digest
+  ENV_FILE: storytold-mcp/.env.sample
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine latest storytold app + mcp-proxy versions
+        id: check
+        run: |
+          set -euo pipefail
+          command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
+          curl -sf "$STORYTOLD_REPO/dists/stable/main/binary-amd64/Packages" -o /tmp/Packages
+
+          # The index keeps several versions per app and is NOT in version
+          # order (deckcraft 0.9.0 is listed after 0.12.0), so sort -V the
+          # pkg=version pairs and keep the last per package. No early exit
+          # anywhere in the pipe (SIGPIPE under pipefail). artcraft-launcher
+          # is the GUI-only installer, not an MCP app.
+          PINS=$(awk '/^Package:/ { p=$2 } /^Version:/ { print p "=" $2 }' /tmp/Packages \
+            | sort -V \
+            | awk -F= '$1 != "artcraft-launcher" { v[$1]=$2 } END { for (k in v) print k "=" v[k] }' \
+            | sort | tr '\n' ' ' | sed 's/ $//')
+          MCP_PROXY=$(curl -sf https://pypi.org/pypi/mcp-proxy/json | jq -r .info.version)
+
+          if [ -z "$PINS" ]; then
+            echo "::error::no packages found in the storytold Packages index" >&2
+            exit 1
+          fi
+          if [ -z "$MCP_PROXY" ] || [ "$MCP_PROXY" = "null" ]; then
+            echo "::error::could not determine latest mcp-proxy version" >&2
+            exit 1
+          fi
+
+          # The tracked file is exactly what "Record built version" writes.
+          LATEST=$({ printf '%s\n' $PINS; echo "mcp-proxy=$MCP_PROXY"; } | sort)
+          CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo none)
+
+          # 13 apps have no single version: the tag is a short hash of the
+          # whole set (the push step adds a dated rollback tag next to it).
+          # The image's /etc/mcp-proxy/versions.txt lists the real versions.
+          TAG=$(printf '%s\n' "$LATEST" | sha256sum | cut -c1-12)
+
+          echo "latest:"; printf '%s\n' "$LATEST"
+          echo "changes (- current / + latest):"
+          diff <(printf '%s\n' "$CURRENT") <(printf '%s\n' "$LATEST") | grep '^[<>]' || true
+          echo "tag=$TAG"
+
+          echo "pins=$PINS" >> "$GITHUB_OUTPUT"
+          echo "mcp_proxy=$MCP_PROXY" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Also rebuild when the base image is re-published under the same tag
+      # (Ubuntu security updates), not only when the tracked packages move --
+      # the Dockerfile's dist-upgrade only helps when a build actually runs.
+      - name: Check base image digest
+        id: base
+        run: |
+          set -euo pipefail
+          DIGEST=$(bash .gitea/scripts/base-digest.sh storytold-mcp/docker/Dockerfile)
+          CURRENT=$(cat "$BASE_DIGEST_FILE" 2>/dev/null || echo none)
+          echo "base image: current=$CURRENT latest=$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          if [ "$DIGEST" != "$CURRENT" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
+        run: |
+          # --no-cache: --pull only refreshes the base layer. With an
+          # unchanged base digest the cached apt layer (update/dist-upgrade/
+          # install) would be reused, so archive security fixes for packages
+          # not in the base would never land.
+          docker build --pull --no-cache \
+            --build-arg STORYTOLD_PINS="${{ steps.check.outputs.pins }}" \
+            --build-arg MCP_PROXY_VERSION="${{ steps.check.outputs.mcp_proxy }}" \
+            -t "$IMAGE:${{ steps.check.outputs.tag }}" \
+            -t "$IMAGE:latest" \
+            storytold-mcp/docker
+
+      # Startup banner (image name + version, figlet style) as a thin layer
+      # on top of the built image, same tags -- see .gitea/scripts/add-banner.sh.
+      - name: Add startup banner
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
+        run: |
+          bash .gitea/scripts/add-banner.sh \
+            "$IMAGE:${{ steps.check.outputs.tag }}" \
+            "$IMAGE:latest"
+
+      # Fail the publish on a fixable CRITICAL/HIGH (OS packages and the
+      # apps' bundled Rust crates). Lower severities and CVEs with no
+      # available fix are reported but don't block. To relax: drop
+      # `--exit-code 1` (report-only) or narrow `--severity`.
+      - name: Security scan (Trivy)
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          bash .gitea/scripts/trivy-scan.sh "$IMAGE:latest"
+
+      - name: Push image
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
+        env:
+          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY" \
+            -u "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE:${{ steps.check.outputs.tag }}"
+          # Dated tag next to the moving version tag: a rebuild (push, base
+          # update) re-publishes the same version tag, this keeps the
+          # previous build pullable for a rollback.
+          DATED="$IMAGE:${{ steps.check.outputs.tag }}-$(date -u +%Y%m%d)"
+          docker tag "$IMAGE:${{ steps.check.outputs.tag }}" "$DATED"
+          docker push "$DATED"
+          docker push "$IMAGE:latest"
+
+      - name: Record built version
+        if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
+        run: |
+          { printf '%s\n' ${{ steps.check.outputs.pins }}; echo "mcp-proxy=${{ steps.check.outputs.mcp_proxy }}"; } | sort > "$VERSION_FILE"
+          echo "${{ steps.base.outputs.digest }}" > "$BASE_DIGEST_FILE"
+          # keep storytold-mcp/.env.sample (template for the local .env) in sync
+          sed -i \
+            -e 's/^STORYTOLD_PINS=.*/STORYTOLD_PINS="${{ steps.check.outputs.pins }}"/' \
+            -e 's/^MCP_PROXY_VERSION=.*/MCP_PROXY_VERSION=${{ steps.check.outputs.mcp_proxy }}/' \
+            "$ENV_FILE"
+          git config user.email "gitea-actions@linux-ng.de"
+          git config user.name "gitea-actions"
+          git add "$VERSION_FILE" "$ENV_FILE" "$BASE_DIGEST_FILE"
+          # A push-triggered rebuild with no upstream change writes identical
+          # content -- only commit/push when the tracked version actually moved.
+          if git diff --cached --quiet; then
+            echo "no version change to record"
+            exit 0
+          fi
+          if [ "${{ steps.check.outputs.changed }}" = true ]; then
+            # body: the package lines that moved, e.g. "+deckcraft=0.12.0-1"
+            CHANGES=$(git diff --cached -U0 "$VERSION_FILE" | grep '^[-+][a-z]' || true)
+            git commit -m "storytold-mcp: bump tracked package set to ${{ steps.check.outputs.tag }}" \
+              -m "$CHANGES" -m "base image: ${{ steps.base.outputs.digest }}"
+          else
+            git commit -m "storytold-mcp: rebuild on updated base image ${{ steps.base.outputs.digest }}"
+          fi
+          # Other workflows in this repo can push their own version-bump
+          # commits around the same time -- retry with rebase on a
+          # non-fast-forward push instead of failing outright.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::failed to push after $attempt attempts" >&2
+              exit 1
+            fi
+            sleep $((RANDOM % 5 + 1))
+            git fetch origin main
+            git rebase origin/main
+          done

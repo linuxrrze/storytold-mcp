@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Manage the stdio MCP servers that mcp-proxy serves over HTTP.
+
+  mcp-servers detect           (build time) probe every installed <app>-cli
+                               with an MCP `initialize`, write APPS_FILE
+  mcp-servers render           (container start) write the mcp-proxy
+                               --named-server-config file for APPS_FILE,
+                               with app-args.conf expanded for this WORK_DIR
+  mcp-servers client-config [claude|opencode]
+                               print ready-to-paste client config for the
+                               served apps (URLs on MCP_SERVICE_HOST:8080)
+
+Kept identical in storytold-mcp/ and solidcraft-mcp/ -- edit both.
+"""
+import json
+import os
+import selectors
+import shlex
+import subprocess
+import sys
+import time
+
+CONF_DIR = "/etc/mcp-proxy"
+APPS_FILE = f"{CONF_DIR}/apps.list"
+ARGS_FILE = f"{CONF_DIR}/app-args.conf"
+SERVERS_FILE = os.environ.get("MCP_SERVERS_FILE", "/tmp/mcp-servers.json")
+PROBE_TIMEOUT = 30
+
+INIT = json.dumps({
+    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "mcp-servers-probe", "version": "1"}},
+})
+
+
+def app_args():
+    """app -> extra `mcp` args from app-args.conf ($VARS still unexpanded)."""
+    args = {}
+    with open(ARGS_FILE) as f:
+        for line in f:
+            line = line.split("#", 1)[0].strip()
+            if line:
+                app, *rest = line.split(None, 1)
+                args[app] = shlex.split(rest[0]) if rest else []
+    return args
+
+
+def command(app, extra):
+    return [f"/usr/bin/{app}-cli", "mcp", *(os.path.expandvars(a) for a in extra)]
+
+
+def probe(cmd):
+    """True if cmd answers an MCP initialize on stdio within PROBE_TIMEOUT."""
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True)
+    except OSError:
+        return False
+    try:
+        # stdin stays open: some servers exit on EOF before answering.
+        p.stdin.write(INIT + "\n")
+        p.stdin.flush()
+        sel = selectors.DefaultSelector()
+        sel.register(p.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + PROBE_TIMEOUT
+        while (left := deadline - time.monotonic()) > 0 and sel.select(left):
+            line = p.stdout.readline()
+            if not line:
+                return False
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue  # stray log line on stdout
+            if isinstance(msg, dict) and msg.get("id") == 1:
+                return "result" in msg
+        return False
+    except (BrokenPipeError, OSError):
+        return False
+    finally:
+        p.kill()
+        p.wait()
+
+
+def detect():
+    # Every package installs /usr/bin/<app> (GUI) + /usr/bin/<app>-cli;
+    # requiring both skips compat shims such as solidcraft's solvecraft-cli.
+    apps = sorted(n[:-4] for n in os.listdir("/usr/bin")
+                  if n.endswith("-cli") and os.path.exists(f"/usr/bin/{n[:-4]}"))
+    conf = app_args()
+    os.makedirs(os.environ["WORK_DIR"], exist_ok=True)
+    served, skipped = [], []
+    for app in apps:
+        extra = conf.get(app, [])
+        if probe(command(app, extra)):
+            served.append(app)
+        elif extra and probe(command(app, [])):
+            # Plain `mcp` works, our flags don't: an upstream flag change.
+            # Fail loudly rather than serve the app unconfined.
+            sys.exit(f"detect: {app}-cli mcp rejects its app-args.conf flags {extra}")
+        else:
+            skipped.append(app)
+    print(f"detect: serving {' '.join(served) or '-'}")
+    print(f"detect: skipped (no working MCP server) {' '.join(skipped) or '-'}")
+    if not served:
+        sys.exit("detect: no app answered an MCP initialize")
+    with open(APPS_FILE, "w") as f:
+        f.write("".join(a + "\n" for a in served))
+
+
+def served_apps():
+    with open(APPS_FILE) as f:
+        return f.read().split()
+
+
+def render():
+    conf = app_args()
+    servers = {app: {"command": cmd[0], "args": cmd[1:]}
+               for app in served_apps()
+               for cmd in [command(app, conf.get(app, []))]}
+    with open(SERVERS_FILE, "w") as f:
+        json.dump({"mcpServers": servers}, f, indent=2)
+    print(f"mcp-servers: serving {' '.join(servers)} on :8080/servers/<app>/mcp")
+
+
+def client_config(kind="claude"):
+    host = os.environ.get("MCP_SERVICE_HOST", "localhost")
+    url = f"http://{host}:8080/servers/{{}}/mcp"
+    if kind == "claude":      # .mcp.json / `claude mcp add-json`
+        cfg = {"mcpServers": {a: {"type": "http", "url": url.format(a)}
+                              for a in served_apps()}}
+    elif kind == "opencode":  # opencode.json
+        cfg = {"mcp": {a: {"type": "remote", "url": url.format(a), "enabled": True}
+                       for a in served_apps()}}
+    else:
+        sys.exit("usage: mcp-servers client-config [claude|opencode]")
+    print(json.dumps(cfg, indent=2))
+
+
+if __name__ == "__main__":
+    cmds = {"detect": detect, "render": render, "client-config": client_config}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        sys.exit(__doc__)
+    cmds[sys.argv[1]](*sys.argv[2:])

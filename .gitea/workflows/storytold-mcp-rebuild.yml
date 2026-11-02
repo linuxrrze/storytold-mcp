@@ -44,10 +44,12 @@ jobs:
           # order (deckcraft 0.9.0 is listed after 0.12.0), so sort -V the
           # pkg=version pairs and keep the last per package. No early exit
           # anywhere in the pipe (SIGPIPE under pipefail). artcraft-launcher
-          # is the GUI-only installer, not an MCP app.
+          # is the GUI-only installer, not an MCP app; craft-anything is
+          # excluded for now (unconfined, starts coding agents) -- keep in
+          # sync with the Dockerfile's fallback list.
           PINS=$(awk '/^Package:/ { p=$2 } /^Version:/ { print p "=" $2 }' /tmp/Packages \
             | sort -V \
-            | awk -F= '$1 != "artcraft-launcher" { v[$1]=$2 } END { for (k in v) print k "=" v[k] }' \
+            | awk -F= '$1 != "artcraft-launcher" && $1 != "craft-anything" { v[$1]=$2 } END { for (k in v) print k "=" v[k] }' \
             | sort | tr '\n' ' ' | sed 's/ $//')
           MCP_PROXY=$(curl -sf https://pypi.org/pypi/mcp-proxy/json | jq -r .info.version)
 
@@ -64,7 +66,7 @@ jobs:
           LATEST=$({ printf '%s\n' $PINS; echo "mcp-proxy=$MCP_PROXY"; } | sort)
           CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo none)
 
-          # 13 apps have no single version: the tag is a short hash of the
+          # 14 apps have no single version: the tag is a short hash of the
           # whole set (the push step adds a dated rollback tag next to it).
           # The image's /etc/mcp-proxy/versions.txt lists the real versions.
           TAG=$(printf '%s\n' "$LATEST" | sha256sum | cut -c1-12)

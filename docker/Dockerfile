@@ -36,8 +36,9 @@ apt update
 
 PINS="$STORYTOLD_PINS"
 if [ -z "$PINS" ]; then
-	# Every app in the repo; artcraft-launcher is a GUI-only installer.
-	PINS=$(awk '/^Package:/ && $2 != "artcraft-launcher" { print $2 }' \
+	# Every app in the repo; artcraft-launcher is a GUI-only installer,
+	# craft-anything is excluded for now (same list as the workflow's).
+	PINS=$(awk '/^Package:/ && $2 != "artcraft-launcher" && $2 != "craft-anything" { print $2 }' \
 		/var/lib/apt/lists/*storytold*_Packages | sort -u)
 fi
 # Headless MCP needs no display, but the apps link the X11/Wayland/Vulkan
@@ -53,6 +54,12 @@ apt install -y $PINS --no-install-recommends \
 for pin in $STORYTOLD_PINS; do
 	dpkg-query -W -f='${Version}\n' "${pin%%=*}" | grep -qxF "${pin#*=}"
 done
+# Installed app versions, for `docker run ... cat` (mcp-proxy appended below).
+# Package names, not a '*craft' glob: an app isn't bound to be named *craft.
+mkdir -p /etc/mcp-proxy
+for pin in $PINS; do
+	dpkg-query -W -f='${Package}=${Version}\n' "${pin%%=*}"
+done > /etc/mcp-proxy/versions.txt
 
 rm -rf /var/lib/apt/lists/*
 
@@ -60,10 +67,12 @@ rm -rf /var/lib/apt/lists/*
 python3 -m venv /opt/mcp-proxy
 /opt/mcp-proxy/bin/pip install --no-cache-dir "mcp-proxy${MCP_PROXY_VERSION:+==$MCP_PROXY_VERSION}"
 ln -s /opt/mcp-proxy/bin/mcp-proxy /usr/local/bin/mcp-proxy
+echo "mcp-proxy=$(/opt/mcp-proxy/bin/pip show mcp-proxy | awk '$1=="Version:"{print $2}')" \
+	>> /etc/mcp-proxy/versions.txt
 
 # Runs under an arbitrary compose `user:` (the codingenv PUID) -- give it a
 # writable HOME for the apps' config/autosave dirs.
-mkdir -p /home/mcp /etc/mcp-proxy
+mkdir -p /home/mcp
 chmod 1777 /home/mcp
 
 # ubuntu:26.04 ships /usr/bin/pebble (Canonical's container init) as a plain
@@ -86,12 +95,8 @@ COPY --chmod=755 files/entrypoint.sh /
 
 # Probe every installed <app>-cli once, so the served set is fixed per
 # image (and visible in the build log). The probe's WORK_DIR is a throwaway.
-# The installed versions go next to it for `docker run ... cat`.
 RUN WORK_DIR=/tmp/mcp-probe mcp-servers detect \
- && rm -rf /tmp/mcp-probe /home/mcp/* /home/mcp/.[!.]* \
- && { dpkg-query -W -f='${Package}=${Version}\n' '*craft'; \
-      echo "mcp-proxy=$(/opt/mcp-proxy/bin/pip show mcp-proxy | awk '$1=="Version:"{print $2}')"; } \
-    > /etc/mcp-proxy/versions.txt
+ && rm -rf /tmp/mcp-probe /home/mcp/* /home/mcp/.[!.]*
 
 WORKDIR /home/sandbox/work
 EXPOSE 8080/tcp

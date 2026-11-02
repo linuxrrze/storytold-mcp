@@ -10,7 +10,8 @@ sample runs this image and [`solidcraft-mcp`](../solidcraft-mcp/) next to
 
 Based on `ubuntu:26.04`, with the apps installed from the `storytold` apt
 repo of [linuxrrze/deb-repos](https://github.com/linuxrrze/deb-repos)
-(every app except `artcraft-launcher`, the GUI installer). Each app package
+(every app except `artcraft-launcher`, the GUI installer, and -- for now --
+`craft-anything`, see below). Each app package
 ships `<app>-cli`, whose `<app>-cli mcp` is a headless MCP server -- **stdio
 only**. [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) serves all of
 them from one process on port 8080:
@@ -23,7 +24,10 @@ them from one process on port 8080:
 
 `<app>` is one of cadcraft, deckcraft, designcraft, effectcraft, figcraft,
 filmcraft, gridcraft, lightcraft, pdfcraft, photocraft, soundcraft,
-vectorcraft, wordcraft -- whichever the build detected (see below).
+texturecraft, vectorcraft, wordcraft -- whichever the build detected (see
+below). New apps in the repo are picked up
+automatically; only their `app-args.conf` line (work-dir confinement) has
+to be added by hand.
 
 ## Files
 
@@ -62,6 +66,11 @@ docker compose up -d
   as their cwd, and every app with automation-root flags (see
   `app-args.conf`) can only read/write inside it; cadcraft, filmcraft,
   gridcraft and lightcraft have no such flag in MCP mode.
+- **Not included: craft-anything.** The repo's reverse-engineering tool is
+  excluded for now (workflow's version check + the Dockerfile's fallback
+  list): it has no work-dir confinement flag, and its `rebuild_*` tools
+  start a coding agent (needs an AI backend via `craft-anything-cli ai
+  ...`).
 - **User:** the containers run as `PUID:PGID` (codingenv's), so files they
   write into the work dir are yours. The entrypoint aborts if the work dir
   is missing or not writable for that uid.
@@ -124,7 +133,7 @@ on pushes to `main` that touch `storytold-mcp/docker/**` or the workflow.
 - Build (`docker build --pull --no-cache`), startup banner
   (`.gitea/scripts/add-banner.sh`), Trivy scan
   (`.gitea/scripts/trivy-scan.sh`).
-- **Tags:** 13 apps have no single version, so the version tag is the
+- **Tags:** 14 apps have no single version, so the version tag is the
   first 12 hex digits of the version list's sha256, plus
   `<tag>-<YYYYMMDD>` (rollback) and `latest`.
 - Finally CI writes the version list/digest to `.storytold-mcp-version`,

@@ -44,7 +44,7 @@ services:
     image: git.linux-ng.de/marcel/storytold-mcp:latest
     container_name: storytold-mcp
     # Each served app runs as its own headless engine from the start
-    # (13 apps): budget RAM accordingly.
+    # (14 apps): budget RAM accordingly.
 
   solidcraft-mcp:
     <<: *mcp

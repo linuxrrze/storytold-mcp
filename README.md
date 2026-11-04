@@ -39,7 +39,7 @@ to be added by hand.
 | `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-proxy. Identical copy in `solidcraft-mcp/`. |
 | `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app + `mcp-proxy`) CI last built; compared against the repo index + PyPI. Updated automatically by CI. |
 | `.storytold-mcp-base-digest` | yes | Registry digest of the `ubuntu:26.04` base image the last build used. Updated automatically by CI. |
-| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` + `MCP_PROXY_VERSION` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`) and `TZ`. No secrets. |
+| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` + `MCP_PROXY_VERSION` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`) and `TZ`. No secrets. |
 | `docker-compose.yml.sample` | no | Sanitized hub compose for storytold-mcp + solidcraft-mcp. The real file is gitignored. |
 
 ## Usage

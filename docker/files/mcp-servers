@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Manage the stdio MCP servers that mcp-proxy serves over HTTP.
+"""Manage the stdio MCP servers that mcp-gateway serves over HTTP.
 
   mcp-servers detect           (build time) probe every installed <app>-cli
                                with an MCP `initialize`, write APPS_FILE
-  mcp-servers render           (container start) write the mcp-proxy
-                               --named-server-config file for APPS_FILE,
+  mcp-servers render           (container start) write the mcp-gateway
+                               --config file for APPS_FILE,
                                with app-args.conf expanded for this WORK_DIR
   mcp-servers client-config [claude|opencode]
                                print ready-to-paste client config for the
@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-CONF_DIR = "/etc/mcp-proxy"
+CONF_DIR = "/etc/mcp-gateway"
 APPS_FILE = f"{CONF_DIR}/apps.list"
 ARGS_FILE = f"{CONF_DIR}/app-args.conf"
 SERVERS_FILE = os.environ.get("MCP_SERVERS_FILE", "/tmp/mcp-servers.json")

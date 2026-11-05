@@ -1,0 +1,685 @@
+#!/usr/bin/env python3
+"""mcp-gateway: serve stdio MCP servers over Streamable HTTP and raw TCP, on demand.
+
+HTTP (Streamable HTTP, MCP 2025-03-26 .. 2025-11-25 sessions):
+  POST/GET/DELETE /servers/<name>/mcp
+  Every MCP session gets its own server process. It is started by the client's
+  initialize request and stopped when the client deletes the session, when the
+  process exits, or after the session has been idle (no request in flight and no
+  open GET stream) for the idle timeout.
+  GET /healthz   liveness, no authentication
+  GET /status    servers and running sessions (JSON)
+
+Raw TCP (optional, per server "tcpPort"):
+  Every TCP connection gets its own server process, its stdin/stdout connected
+  to the socket (newline-delimited JSON-RPC). No authentication: trusted
+  networks only.
+
+Python 3 standard library only. Kept identical in storytold-mcp/ and
+solidcraft-mcp/ -- edit both.
+"""
+
+import argparse
+import collections
+import hmac
+import http.server
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import uuid
+import queue
+
+log = logging.getLogger("mcp-gateway")
+
+ROUTE = re.compile(r"^/servers/([A-Za-z0-9_.-]+)/mcp/?$")
+KEEPALIVE = 15          # seconds between SSE comments, also how dead clients are noticed
+MAX_BODY = 64 << 20
+CLOSED = object()       # queue sentinel: the session or stream ended
+LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+
+
+def rpc_error(code, message, id=None):
+    return {"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}
+
+
+def id_key(id):
+    return json.dumps(id, sort_keys=True)
+
+
+def stop_process(proc, grace=5):
+    """SIGTERM the process group, SIGKILL it after the grace period."""
+    if proc.poll() is not None:
+        return
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, grace)):
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(wait)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def spawn(server, tag):
+    env = os.environ.copy()
+    env.update(server.env)
+    proc = subprocess.Popen(
+        server.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        env=env, cwd=server.cwd, start_new_session=True)
+    threading.Thread(target=pipe_stderr, args=(proc, tag), daemon=True).start()
+    return proc
+
+
+def pipe_stderr(proc, tag):
+    for line in proc.stderr:
+        log.info("[%s] %s", tag, line.decode(errors="replace").rstrip())
+
+
+class Server:
+    """One configured stdio MCP server."""
+
+    def __init__(self, name, spec, defaults):
+        self.name = name
+        self.command = [spec["command"], *spec.get("args", [])]
+        self.env = {k: str(v) for k, v in spec.get("env", {}).items()}
+        self.cwd = spec.get("cwd")
+        self.max_sessions = int(spec.get("maxSessions", defaults.max_sessions))
+        self.idle_timeout = float(spec.get("idleTimeout", defaults.idle_timeout))
+        self.tcp_port = spec.get("tcpPort")
+        self.sessions = {}      # HTTP session id -> Session
+        self.instances = 0      # running processes: HTTP sessions and TCP connections
+        self.lock = threading.Lock()
+
+    def reserve(self):
+        """Count a new instance; False when the server is at maxSessions."""
+        with self.lock:
+            if self.max_sessions and self.instances >= self.max_sessions:
+                return False
+            self.instances += 1
+            return True
+
+    def release(self):
+        with self.lock:
+            self.instances -= 1
+
+
+class Session:
+    """An HTTP MCP session and the server process that serves it."""
+
+    def __init__(self, server):
+        self.server = server
+        self.id = uuid.uuid4().hex
+        self.tag = f"{server.name}/{self.id[:8]}"
+        self.lock = threading.Lock()
+        self.write_lock = threading.Lock()
+        self.pending = {}               # request id key -> queue of the POST waiting for it
+        self.post_streams = []          # queues of POST SSE streams that are open, newest last
+        self.get_stream = None          # queue of the open GET stream
+        self.backlog = collections.deque(maxlen=1000)
+        self.busy = 0
+        self.last_used = time.monotonic()
+        self.closed = threading.Event()
+        self.proc = spawn(server, self.tag)
+        log.info("[%s] started pid %d", self.tag, self.proc.pid)
+        threading.Thread(target=self.read_stdout, daemon=True).start()
+
+    def read_stdout(self):
+        for line in self.proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                log.warning("[%s] not JSON on stdout: %.200s", self.tag, line.decode(errors="replace"))
+                continue
+            self.route(msg)
+        code = self.proc.wait()
+        log.info("[%s] exited with %s", self.tag, code)
+        self.close()
+
+    def route(self, msg):
+        with self.lock:
+            if isinstance(msg, dict) and "method" not in msg and "id" in msg:
+                q = self.pending.pop(id_key(msg["id"]), None)
+                if q is None:
+                    log.warning("[%s] dropped response to unknown id %r", self.tag, msg.get("id"))
+                    return
+            else:
+                # A server request or notification: on the newest POST stream (it is
+                # most likely about that request), else the GET stream, else kept.
+                q = self.post_streams[-1] if self.post_streams else self.get_stream
+                if q is None:
+                    self.backlog.append(msg)
+                    return
+        q.put(msg)
+
+    def send(self, msgs):
+        data = b"".join(json.dumps(m, separators=(",", ":")).encode() + b"\n" for m in msgs)
+        with self.write_lock:
+            try:
+                self.proc.stdin.write(data)
+                self.proc.stdin.flush()
+            except (BrokenPipeError, ValueError, OSError):
+                self.close()
+                raise ConnectionError("server process is gone")
+
+    def expect(self, ids, q):
+        with self.lock:
+            for i in ids:
+                self.pending[id_key(i)] = q
+
+    def forget(self, ids):
+        with self.lock:
+            for i in ids:
+                self.pending.pop(id_key(i), None)
+
+    def open_post_stream(self, q):
+        with self.lock:
+            self.post_streams.append(q)
+
+    def close_post_stream(self, q):
+        with self.lock:
+            if q in self.post_streams:
+                self.post_streams.remove(q)
+
+    def open_get_stream(self):
+        q = queue.Queue()
+        with self.lock:
+            old, self.get_stream = self.get_stream, q
+            while self.backlog:
+                q.put(self.backlog.popleft())
+        if old is not None:
+            old.put(CLOSED)
+        return q
+
+    def close_get_stream(self, q):
+        with self.lock:
+            if self.get_stream is q:
+                self.get_stream = None
+                self.last_used = time.monotonic()
+
+    def enter(self):
+        with self.lock:
+            self.busy += 1
+
+    def leave(self):
+        with self.lock:
+            self.busy -= 1
+            self.last_used = time.monotonic()
+
+    def idle_for(self):
+        with self.lock:
+            if self.busy or self.get_stream is not None:
+                return 0
+            return time.monotonic() - self.last_used
+
+    def close(self):
+        if self.closed.is_set():
+            return
+        self.closed.set()
+        with self.server.lock:
+            self.server.sessions.pop(self.id, None)
+        self.server.release()
+        with self.lock:
+            queues = list(self.pending.values()) + self.post_streams + [self.get_stream]
+            self.pending.clear()
+        for q in {id(q): q for q in queues if q is not None}.values():
+            q.put(CLOSED)
+        threading.Thread(target=stop_process, args=(self.proc,), daemon=True).start()
+
+
+class Gateway:
+    def __init__(self, servers, api_keys, allowed_origins, allowed_hosts, init_timeout):
+        self.servers = servers
+        self.api_keys = [k.encode() for k in api_keys]
+        self.allowed_origins = set(allowed_origins)
+        self.allowed_hosts = {h.lower() for h in allowed_hosts}
+        self.init_timeout = init_timeout
+
+    def reap(self):
+        while True:
+            time.sleep(10)
+            for server in self.servers.values():
+                if not server.idle_timeout:
+                    continue
+                with server.lock:
+                    sessions = list(server.sessions.values())
+                for s in sessions:
+                    if s.idle_for() > server.idle_timeout:
+                        log.info("[%s] idle for %ds, stopping", s.tag, server.idle_timeout)
+                        s.close()
+
+    def status(self):
+        out = {}
+        for name, server in self.servers.items():
+            with server.lock:
+                sessions = list(server.sessions.values())
+            out[name] = {
+                "command": server.command,
+                "maxSessions": server.max_sessions,
+                "tcpPort": server.tcp_port,
+                "tcpConnections": server.instances - len(sessions),
+                "sessions": [{"id": s.id[:8], "pid": s.proc.pid, "busy": s.busy,
+                              "getStream": s.get_stream is not None,
+                              "idleSeconds": int(s.idle_for())} for s in sessions],
+            }
+        return out
+
+    def shutdown(self):
+        for server in self.servers.values():
+            with server.lock:
+                sessions = list(server.sessions.values())
+            for s in sessions:
+                s.close()
+                stop_process(s.proc)
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "mcp-gateway"
+    gw: Gateway = None
+
+    def log_message(self, fmt, *args):
+        log.debug("%s %s", self.address_string(), fmt % args)
+
+    # --- plumbing -------------------------------------------------------
+
+    def reply(self, status, body=None, headers=()):
+        data = b"" if body is None else json.dumps(body).encode()
+        self.send_response(status)
+        if body is not None:
+            self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def start_sse(self, headers=()):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Transfer-Encoding", "chunked")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.end_headers()
+
+    def chunk(self, data):
+        self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+        self.wfile.flush()
+
+    def sse(self, msg):
+        self.chunk(b"event: message\ndata: " + json.dumps(msg, separators=(",", ":")).encode() + b"\n\n")
+
+    def end_sse(self):
+        try:
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            pass
+
+    def read_body(self):
+        if self.headers.get("Transfer-Encoding", "").lower() == "chunked":
+            data = b""
+            while True:
+                size = int(self.rfile.readline().split(b";")[0], 16)
+                if size == 0:
+                    self.rfile.readline()
+                    return data
+                data += self.rfile.read(size)
+                self.rfile.readline()
+                if len(data) > MAX_BODY:
+                    raise ValueError("body too large")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            raise ValueError("body too large")
+        return self.rfile.read(length)
+
+    def allowed(self):
+        """Origin, Host and API key checks; replies and returns False on failure."""
+        gw = self.gw
+        origin = self.headers.get("Origin")
+        if origin and origin not in gw.allowed_origins:
+            self.reply(403, rpc_error(-32000, "Forbidden: origin not allowed"))
+            return False
+        if gw.allowed_hosts:
+            # An entry with a port must match exactly, one without matches any port;
+            # loopback is always accepted (health checks).
+            authority = (self.headers.get("Host") or "").lower()
+            m = re.fullmatch(r"(\[[^\]]*\]|[^:]*)(?::\d+)?", authority)
+            host = m.group(1).strip("[]") if m else ""
+            if authority not in gw.allowed_hosts and host not in gw.allowed_hosts | LOOPBACK:
+                self.reply(421, rpc_error(-32000, "Misdirected Request: host not allowed"))
+                return False
+        if gw.api_keys:
+            auth = self.headers.get("Authorization", "")
+            key = auth[7:] if auth[:7].lower() == "bearer " else self.headers.get("X-API-Key", "")
+            if not any(hmac.compare_digest(key.encode(), k) for k in gw.api_keys):
+                self.reply(401, rpc_error(-32000, "Unauthorized"), [("WWW-Authenticate", "Bearer")])
+                return False
+        return True
+
+    def target(self):
+        """The server and session for an MCP request, or None after replying."""
+        path = self.path.split("?", 1)[0]
+        m = ROUTE.match(path)
+        if not m:
+            self.reply(404, rpc_error(-32000, "Not found"))
+            return None
+        server = self.gw.servers.get(m.group(1))
+        if server is None:
+            self.reply(404, rpc_error(-32000, f"Unknown MCP server {m.group(1)!r}"))
+            return None
+        if not self.allowed():
+            return None
+        return server
+
+    def session_of(self, server):
+        sid = self.headers.get("Mcp-Session-Id")
+        if not sid:
+            self.reply(400, rpc_error(-32000, "Bad Request: No valid session ID provided"))
+            return None
+        with server.lock:
+            s = server.sessions.get(sid)
+        if s is None or s.closed.is_set():
+            self.reply(404, rpc_error(-32001, "Session not found"))
+            return None
+        return s
+
+    # --- HTTP methods ---------------------------------------------------
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/healthz":
+            return self.reply(200, {"status": "ok"})
+        if path == "/status":
+            if self.allowed():
+                self.reply(200, self.gw.status())
+            return
+        server = self.target()
+        if server is None:
+            return
+        if "text/event-stream" not in self.headers.get("Accept", ""):
+            return self.reply(406, rpc_error(-32000, "Not Acceptable: Client must accept text/event-stream"))
+        s = self.session_of(server)
+        if s is None:
+            return
+        q = s.open_get_stream()
+        try:
+            self.start_sse()
+            while True:
+                try:
+                    msg = q.get(timeout=KEEPALIVE)
+                except queue.Empty:
+                    self.chunk(b": keepalive\n\n")
+                    continue
+                if msg is CLOSED:
+                    break
+                self.sse(msg)
+            self.end_sse()
+        except OSError:
+            pass
+        finally:
+            s.close_get_stream(q)
+            self.close_connection = True
+
+    def do_DELETE(self):
+        server = self.target()
+        if server is None:
+            return
+        s = self.session_of(server)
+        if s is None:
+            return
+        log.info("[%s] deleted by client", s.tag)
+        s.close()
+        self.reply(200)
+
+    def do_POST(self):
+        server = self.target()
+        if server is None:
+            return
+        try:
+            body = json.loads(self.read_body())
+        except ValueError as e:
+            return self.reply(400, rpc_error(-32700, f"Parse error: {e}"))
+        msgs = body if isinstance(body, list) else [body]
+        if not msgs or not all(isinstance(m, dict) for m in msgs):
+            return self.reply(400, rpc_error(-32600, "Invalid Request"))
+        requests = [m for m in msgs if "method" in m and "id" in m]
+        if any(m.get("method") == "initialize" for m in requests):
+            return self.initialize(server, msgs, requests)
+        s = self.session_of(server)
+        if s is None:
+            return
+        if not requests:
+            try:
+                s.send(msgs)
+            except ConnectionError:
+                return self.reply(404, rpc_error(-32001, "Session not found"))
+            return self.reply(202)
+        self.exchange(s, msgs, requests, isinstance(body, list))
+
+    def initialize(self, server, msgs, requests):
+        if len(requests) != 1:
+            return self.reply(400, rpc_error(-32600, "Invalid Request: initialize must be sent alone"))
+        if not server.reserve():
+            return self.reply(503, rpc_error(-32000, f"Too many sessions for {server.name}"))
+        try:
+            s = Session(server)
+        except OSError as e:
+            server.release()
+            log.error("[%s] cannot start %s: %s", server.name, server.command, e)
+            return self.reply(502, rpc_error(-32603, f"Cannot start MCP server: {e}", requests[0]["id"]))
+        with server.lock:
+            server.sessions[s.id] = s
+        q = queue.Queue()
+        ids = [requests[0]["id"]]
+        s.expect(ids, q)
+        try:
+            s.send(msgs)
+            msg = q.get(timeout=self.gw.init_timeout)
+        except (ConnectionError, queue.Empty):
+            msg = CLOSED
+        if msg is CLOSED or "error" in msg:
+            s.close()
+            err = msg if msg is not CLOSED else rpc_error(-32603, "MCP server did not initialize", ids[0])
+            return self.reply(502 if msg is CLOSED else 200, err)
+        s.last_used = time.monotonic()
+        headers = [("Mcp-Session-Id", s.id)]
+        if "text/event-stream" in self.headers.get("Accept", "") and \
+                "application/json" not in self.headers.get("Accept", ""):
+            self.start_sse(headers)
+            self.sse(msg)
+            self.end_sse()
+        else:
+            self.reply(200, msg, headers)
+
+    def exchange(self, s, msgs, requests, batch):
+        """Send requests to the server process and answer with their responses."""
+        ids = [m["id"] for m in requests]
+        q = queue.Queue()
+        use_sse = "text/event-stream" in self.headers.get("Accept", "")
+        s.enter()
+        s.expect(ids, q)
+        if use_sse:
+            s.open_post_stream(q)
+        try:
+            try:
+                s.send(msgs)
+            except ConnectionError:
+                return self.reply(404, rpc_error(-32001, "Session not found"))
+            waiting = {id_key(i) for i in ids}
+            if use_sse:
+                self.start_sse()
+                while waiting:
+                    try:
+                        msg = q.get(timeout=KEEPALIVE)
+                    except queue.Empty:
+                        self.chunk(b": keepalive\n\n")
+                        continue
+                    if msg is CLOSED:
+                        for k in waiting:
+                            self.sse(rpc_error(-32603, "MCP server process exited", json.loads(k)))
+                        break
+                    if "method" not in msg and "id" in msg:
+                        waiting.discard(id_key(msg["id"]))
+                    self.sse(msg)
+                self.end_sse()
+            else:
+                responses = []
+                while waiting:
+                    msg = q.get()
+                    if msg is CLOSED:
+                        responses += [rpc_error(-32603, "MCP server process exited", json.loads(k)) for k in waiting]
+                        break
+                    waiting.discard(id_key(msg["id"]))
+                    responses.append(msg)
+                self.reply(200, responses if batch else responses[0])
+        except OSError:
+            self.close_connection = True     # client went away; the server keeps working
+        finally:
+            s.forget(ids)
+            if use_sse:
+                s.close_post_stream(q)
+            s.leave()
+
+
+class HTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    address_family = socket.AF_INET6 if ":" in os.environ.get("MCP_GATEWAY_HOST", "") else socket.AF_INET
+
+
+class TCPHandler(socketserver.BaseRequestHandler):
+    """Raw TCP: one server process per connection, socket <-> stdin/stdout."""
+
+    def handle(self):
+        server = self.server.mcp
+        peer = "%s:%s" % self.client_address[:2]
+        if not server.reserve():
+            log.warning("[%s/tcp] refused %s: too many instances", server.name, peer)
+            return
+        try:
+            proc = spawn(server, f"{server.name}/tcp {peer}")
+        except OSError as e:
+            server.release()
+            log.error("[%s/tcp] cannot start %s: %s", server.name, server.command, e)
+            return
+        log.info("[%s/tcp] %s connected, pid %d", server.name, peer, proc.pid)
+        sock = self.request
+
+        def upstream():
+            try:
+                while data := sock.recv(65536):
+                    proc.stdin.write(data)
+                    proc.stdin.flush()
+            except OSError:
+                pass
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=upstream, daemon=True)
+        t.start()
+        try:
+            while data := proc.stdout.read1(65536):
+                sock.sendall(data)
+        except OSError:
+            pass
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        t.join(1)
+        stop_process(proc)
+        server.release()
+        log.info("[%s/tcp] %s closed, exit %s", server.name, peer, proc.returncode)
+
+
+class TCPServer(socketserver.ThreadingTCPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def load_servers(path, defaults):
+    with open(path) as f:
+        cfg = json.load(f)
+    servers = {}
+    for name, spec in cfg.get("mcpServers", {}).items():
+        if spec.get("disabled"):
+            continue
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+            sys.exit(f"mcp-gateway: invalid server name {name!r}")
+        servers[name] = Server(name, spec, defaults)
+    if not servers:
+        sys.exit(f"mcp-gateway: no servers in {path}")
+    return servers
+
+
+def main():
+    env = os.environ.get
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("--config", default=env("MCP_GATEWAY_CONFIG", "/etc/mcp-gateway/servers.json"),
+                   help='JSON file: {"mcpServers": {name: {command, args, env, cwd, maxSessions, idleTimeout, tcpPort}}}')
+    p.add_argument("--host", default=env("MCP_GATEWAY_HOST", "0.0.0.0"))
+    p.add_argument("--port", type=int, default=int(env("MCP_GATEWAY_PORT", "8080")))
+    p.add_argument("--tcp-host", default=env("MCP_TCP_HOST", "0.0.0.0"), help="address of the raw TCP listeners")
+    p.add_argument("--idle-timeout", type=float, default=float(env("MCP_IDLE_TIMEOUT", "1800")),
+                   help="stop a session's process after this many idle seconds (0: never)")
+    p.add_argument("--max-sessions", type=int, default=int(env("MCP_MAX_SESSIONS", "16")),
+                   help="running instances per server, HTTP sessions plus TCP connections (0: unlimited)")
+    p.add_argument("--init-timeout", type=float, default=float(env("MCP_INIT_TIMEOUT", "60")))
+    p.add_argument("--api-key-file", default=env("MCP_API_KEY_FILE"), help="accepted API keys, one per line")
+    p.add_argument("--allowed-origin", action="append",
+                   default=[o for o in env("MCP_ALLOWED_ORIGINS", "").split(",") if o])
+    p.add_argument("--allowed-host", action="append",
+                   default=env("MCP_ALLOWED_HOSTS", "").replace(",", " ").split(),
+                   help="accepted Host header: host (any port) or host:port; loopback is always accepted (default: any)")
+    p.add_argument("--log-level", default=env("MCP_LOG_LEVEL", "INFO"))
+    args = p.parse_args()
+    logging.basicConfig(level=args.log_level.upper(), stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(message)s")
+
+    keys = [env("MCP_API_KEY")] if env("MCP_API_KEY") else []
+    if args.api_key_file:
+        with open(args.api_key_file) as f:
+            keys += [line.strip() for line in f if line.strip()]
+    servers = load_servers(args.config, args)
+    gw = Gateway(servers, keys, args.allowed_origin, args.allowed_host, args.init_timeout)
+    Handler.gw = gw
+
+    for server in servers.values():
+        if server.tcp_port:
+            tcp = TCPServer((args.tcp_host, int(server.tcp_port)), TCPHandler)
+            tcp.mcp = server
+            threading.Thread(target=tcp.serve_forever, daemon=True).start()
+            log.info("%s: raw TCP on %s:%s, one process per connection", server.name, args.tcp_host, server.tcp_port)
+
+    httpd = HTTPServer((args.host, args.port), Handler)
+    threading.Thread(target=gw.reap, daemon=True).start()
+
+    def stop(signum, frame):
+        log.info("signal %d, stopping all sessions", signum)
+        threading.Thread(target=httpd.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    for name in servers:
+        log.info("%s: http://%s:%d/servers/%s/mcp, one process per session", name, args.host, args.port, name)
+    log.info("idle timeout %ss, max %s instances per server, API key %s",
+             args.idle_timeout or "off", args.max_sessions or "unlimited", "required" if keys else "off")
+    httpd.serve_forever()
+    gw.shutdown()
+
+
+if __name__ == "__main__":
+    main()

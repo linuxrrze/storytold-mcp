@@ -21,7 +21,7 @@ env:
   STORYTOLD_REPO: https://linuxrrze.github.io/deb-repos/storytold
   REGISTRY: git.linux-ng.de
   IMAGE: git.linux-ng.de/marcel/storytold-mcp
-  # Sorted `<package>=<version>` lines: every storytold app + mcp-proxy.
+  # Sorted `<package>=<version>` lines, one per storytold app.
   VERSION_FILE: storytold-mcp/.storytold-mcp-version
   # Digest of the Dockerfile's base image (ubuntu:26.04) the last build used.
   BASE_DIGEST_FILE: storytold-mcp/.storytold-mcp-base-digest
@@ -33,11 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Determine latest storytold app + mcp-proxy versions
+      - name: Determine latest storytold app versions
         id: check
         run: |
           set -euo pipefail
-          command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq)
           curl -sf "$STORYTOLD_REPO/dists/stable/main/binary-amd64/Packages" -o /tmp/Packages
 
           # The index keeps several versions per app and is NOT in version
@@ -51,24 +50,19 @@ jobs:
             | sort -V \
             | awk -F= '$1 != "artcraft-launcher" && $1 != "craft-anything" { v[$1]=$2 } END { for (k in v) print k "=" v[k] }' \
             | sort | tr '\n' ' ' | sed 's/ $//')
-          MCP_PROXY=$(curl -sf https://pypi.org/pypi/mcp-proxy/json | jq -r .info.version)
 
           if [ -z "$PINS" ]; then
             echo "::error::no packages found in the storytold Packages index" >&2
             exit 1
           fi
-          if [ -z "$MCP_PROXY" ] || [ "$MCP_PROXY" = "null" ]; then
-            echo "::error::could not determine latest mcp-proxy version" >&2
-            exit 1
-          fi
 
           # The tracked file is exactly what "Record built version" writes.
-          LATEST=$({ printf '%s\n' $PINS; echo "mcp-proxy=$MCP_PROXY"; } | sort)
+          LATEST=$(printf '%s\n' $PINS | sort)
           CURRENT=$(cat "$VERSION_FILE" 2>/dev/null || echo none)
 
           # 14 apps have no single version: the tag is a short hash of the
           # whole set (the push step adds a dated rollback tag next to it).
-          # The image's /etc/mcp-proxy/versions.txt lists the real versions.
+          # The image's /etc/mcp-gateway/versions.txt lists the real versions.
           TAG=$(printf '%s\n' "$LATEST" | sha256sum | cut -c1-12)
 
           echo "latest:"; printf '%s\n' "$LATEST"
@@ -77,7 +71,6 @@ jobs:
           echo "tag=$TAG"
 
           echo "pins=$PINS" >> "$GITHUB_OUTPUT"
-          echo "mcp_proxy=$MCP_PROXY" >> "$GITHUB_OUTPUT"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           if [ "$LATEST" != "$CURRENT" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -111,7 +104,6 @@ jobs:
           # not in the base would never land.
           docker build --pull --no-cache \
             --build-arg STORYTOLD_PINS="${{ steps.check.outputs.pins }}" \
-            --build-arg MCP_PROXY_VERSION="${{ steps.check.outputs.mcp_proxy }}" \
             -t "$IMAGE:${{ steps.check.outputs.tag }}" \
             -t "$IMAGE:latest" \
             storytold-mcp/docker
@@ -155,12 +147,11 @@ jobs:
       - name: Record built version
         if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
         run: |
-          { printf '%s\n' ${{ steps.check.outputs.pins }}; echo "mcp-proxy=${{ steps.check.outputs.mcp_proxy }}"; } | sort > "$VERSION_FILE"
+          printf '%s\n' ${{ steps.check.outputs.pins }} | sort > "$VERSION_FILE"
           echo "${{ steps.base.outputs.digest }}" > "$BASE_DIGEST_FILE"
           # keep storytold-mcp/.env.sample (template for the local .env) in sync
           sed -i \
             -e 's/^STORYTOLD_PINS=.*/STORYTOLD_PINS="${{ steps.check.outputs.pins }}"/' \
-            -e 's/^MCP_PROXY_VERSION=.*/MCP_PROXY_VERSION=${{ steps.check.outputs.mcp_proxy }}/' \
             "$ENV_FILE"
           git config user.email "gitea-actions@linux-ng.de"
           git config user.name "gitea-actions"

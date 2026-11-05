@@ -13,14 +13,29 @@ repo of [linuxrrze/deb-repos](https://github.com/linuxrrze/deb-repos)
 (every app except `artcraft-launcher`, the GUI installer, and -- for now --
 `craft-anything`, see below). Each app package
 ships `<app>-cli`, whose `<app>-cli mcp` is a headless MCP server -- **stdio
-only**. [mcp-proxy](https://github.com/sparfenyuk/mcp-proxy) serves all of
-them from one process on port 8080:
+only**. `mcp-gateway` (`docker/files/mcp-gateway`, Python standard library
+only) serves all of them on port 8080, **one server process per MCP
+session**, started on demand:
 
-| Endpoint | Transport |
+| Endpoint | |
 | --- | --- |
-| `http://storytold-mcp:8080/servers/<app>/mcp` | streamable HTTP (use this) |
-| `http://storytold-mcp:8080/servers/<app>/sse` | legacy SSE |
-| `http://storytold-mcp:8080/status` | proxy status (healthcheck) |
+| `http://storytold-mcp:8080/servers/<app>/mcp` | streamable HTTP |
+| `http://storytold-mcp:8080/status` | running sessions per app, with PIDs (JSON) |
+| `http://storytold-mcp:8080/healthz` | liveness (healthcheck) |
+
+- A client's `initialize` starts a fresh `<app>-cli mcp` for that session
+  (3-140 ms), so clients never see each other's open documents.
+- The process is stopped when the client deletes the session, when it
+  exits, or after `MCP_IDLE_TIMEOUT` seconds (default 1800) with no request
+  running and the client's event stream closed. Clients reconnecting after
+  that get a new session -- documents not saved to the work dir are gone.
+- `MCP_MAX_SESSIONS` (default 16) caps the running processes per app;
+  further sessions get HTTP 503.
+- Only the session-based protocol versions (up to 2025-11-25) are offered:
+  the session-less 2026-07-28 protocol would need a process per request,
+  losing the apps' in-memory documents between calls. Clients that try it
+  first fall back (checked with Claude Code 2.1.309 and opencode).
+- The legacy SSE transport (`/servers/<app>/sse` under mcp-proxy) is gone.
 
 `<app>` is one of cadcraft, deckcraft, designcraft, effectcraft, figcraft,
 filmcraft, gridcraft, lightcraft, pdfcraft, photocraft, soundcraft,
@@ -33,13 +48,14 @@ to be added by hand.
 
 | File | Used by CI? | Purpose |
 | --- | --- | --- |
-| `docker/Dockerfile` | yes | Adds the storytold repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, mcp-proxy (`ARG MCP_PROXY_VERSION`) in `/opt/mcp-proxy`, then probes which apps serve MCP. |
-| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-proxy/apps.list`), `render` (start: write mcp-proxy's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in `solidcraft-mcp/`. |
+| `docker/Dockerfile` | yes | Adds the storytold repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, then probes which apps serve MCP. |
+| `docker/files/mcp-gateway` | yes | The HTTP gateway: streamable HTTP per session, idle reaper, Host/Origin checks, optional API key (`MCP_API_KEY`) and per-server raw TCP (unused here). `mcp-gateway --help` lists its options. Identical copy in `solidcraft-mcp/`. |
+| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in `solidcraft-mcp/`. |
 | `docker/files/app-args.conf` | yes | Per-app `mcp` flags -- mostly the automation roots confining file access to the work dir. |
-| `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-proxy. Identical copy in `solidcraft-mcp/`. |
-| `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app + `mcp-proxy`) CI last built; compared against the repo index + PyPI. Updated automatically by CI. |
+| `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-gateway. Identical copy in `solidcraft-mcp/`. |
+| `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app) CI last built; compared against the repo index. Updated automatically by CI. |
 | `.storytold-mcp-base-digest` | yes | Registry digest of the `ubuntu:26.04` base image the last build used. Updated automatically by CI. |
-| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` + `MCP_PROXY_VERSION` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`) and `TZ`. No secrets. |
+| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`) and `TZ`. No secrets. |
 | `docker-compose.yml.sample` | no | Sanitized hub compose for storytold-mcp + solidcraft-mcp. The real file is gitignored. |
 
 ## Usage
@@ -56,8 +72,9 @@ docker compose up -d
 - **Network:** both services join codingenv's compose network
   (`CODINGENV_NETWORK`, default `codingenv_default` -- check with
   `docker network ls`) as an external network, so codingenv's own compose
-  file needs no change. **No ports are published**: mcp-proxy has no
-  authentication, anything on that network can use the servers. The
+  file needs no change. **No ports are published**: without `MCP_API_KEY`
+  the gateway has no authentication, anything on that network can use the
+  servers. The
   sample has a commented `127.0.0.1:8081` mapping for testing from the host.
 - **Shared work dir:** `$HOST_HOME/work` is mounted at
   `/home/sandbox/work` -- the path it already has inside codingenv
@@ -74,10 +91,18 @@ docker compose up -d
 - **User:** the containers run as `PUID:PGID` (codingenv's), so files they
   write into the work dir are yours. The entrypoint aborts if the work dir
   is missing or not writable for that uid.
-- **Resources:** mcp-proxy starts every served app's headless engine at
-  startup, and all clients share that one session per app. Rendering
-  (screenshots, previews) runs on the CPU via Mesa's lavapipe -- no GPU or
-  display needed.
+- **Resources:** nothing runs until a client connects. claude and opencode
+  initialize every configured server when they start, so one client with
+  all 14 apps configured starts 14 processes (~5-20 MB each idle); every
+  further client starts its own. Rendering (screenshots, previews) runs on
+  the CPU via Mesa's lavapipe -- no GPU or display needed; renders go to the
+  `/tmp` tmpfs (10 GB limit in the compose sample), shared by all sessions.
+- **Concurrent instances:** checked for every app: several `<app>-cli mcp`
+  run side by side as the same user without locks, shared state or
+  listening sockets; saves go through uniquely named temp files plus
+  rename, effectcraft's `--autosave` uses a directory per process.
+  Sessions share the work dir, so two clients saving the same file name
+  overwrite each other (last save wins).
 
 ### Connecting claude / opencode in codingenv
 
@@ -106,8 +131,9 @@ opencode (`opencode.json`):
 ### What is installed / served
 
 ```sh
-docker compose exec storytold-mcp cat /etc/mcp-proxy/versions.txt  # package versions
-docker compose exec storytold-mcp cat /etc/mcp-proxy/apps.list     # served apps
+docker compose exec storytold-mcp cat /etc/mcp-gateway/versions.txt  # package versions
+docker compose exec storytold-mcp cat /etc/mcp-gateway/apps.list     # served apps
+docker compose exec storytold-mcp curl -s localhost:8080/status      # running sessions
 ```
 
 ## Build & version tracking
@@ -120,9 +146,8 @@ on pushes to `main` that touch `storytold-mcp/docker/**` or the workflow.
 - **Package versions:** downloads the repo's
   `dists/stable/main/binary-amd64/Packages` and takes the newest version of
   every app. The index keeps several versions per app and is **not** in
-  version order, hence `sort -V` instead of the first/last stanza. Plus
-  mcp-proxy's latest version from PyPI. Any change against
-  `.storytold-mcp-version` triggers a rebuild.
+  version order, hence `sort -V` instead of the first/last stanza. Any
+  change against `.storytold-mcp-version` triggers a rebuild.
 - **Base image:** a new `ubuntu:26.04` digest (vs.
   `.storytold-mcp-base-digest`) also triggers a rebuild.
 - **App detection:** the build probes each `<app>-cli mcp` (with its

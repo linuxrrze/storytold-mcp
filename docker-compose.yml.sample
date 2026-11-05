@@ -1,5 +1,6 @@
 # Craft MCP servers next to codingenv: storytold-mcp (all ArtCraft apps) and
-# solidcraft-mcp, each serving its stdio MCP servers over HTTP at
+# solidcraft-mcp, each serving its stdio MCP servers over HTTP (one server
+# process per MCP session, started on demand) at
 #   http://storytold-mcp:8080/servers/<app>/mcp
 #   http://solidcraft-mcp:8080/servers/solidcraft/mcp
 # Both join codingenv's network, so start codingenv first, then:
@@ -9,8 +10,8 @@
 # Client config for claude/opencode in codingenv:
 #   docker compose exec storytold-mcp mcp-servers client-config claude
 #
-# No ports are published: mcp-proxy has no authentication, so the servers
-# are only reachable from containers on codingenv's network.
+# No ports are published: mcp-gateway runs without authentication here, so
+# the servers are only reachable from containers on codingenv's network.
 
 x-mcp: &mcp
   restart: unless-stopped
@@ -27,11 +28,12 @@ x-mcp: &mcp
     # Option B, mount the same host dir at /home/sandbox/work there too.
     - ${HOST_HOME:-/home/YOURUSER}/work:/home/sandbox/work
   # Scratch (headless renders, the rendered server config), RAM-backed and
-  # wiped on every start. App settings/autosaves live in HOME=/home/mcp in
-  # the container layer: they survive restarts, not a re-create -- anything
-  # worth keeping belongs in the work dir.
+  # wiped on every start, shared by all sessions -- the size is a limit, RAM
+  # is only used for what is actually stored. App settings/autosaves live in
+  # HOME=/home/mcp in the container layer: they survive restarts, not a
+  # re-create -- anything worth keeping belongs in the work dir.
   tmpfs:
-    - /tmp:size=1g
+    - /tmp:size=10g
   networks:
     - codingenv
   # Uncomment to test from the host (e.g. MCP Inspector) -- localhost only.
@@ -43,8 +45,9 @@ services:
     <<: *mcp
     image: git.linux-ng.de/marcel/storytold-mcp:latest
     container_name: storytold-mcp
-    # Each served app runs as its own headless engine from the start
-    # (14 apps): budget RAM accordingly.
+    # Engines start per MCP session: a client (claude/opencode) connecting
+    # to all 14 apps starts 14 processes (~5-20 MB each idle), per client.
+    # Cap them with MCP_MAX_SESSIONS (per app) in .env.
 
   solidcraft-mcp:
     <<: *mcp

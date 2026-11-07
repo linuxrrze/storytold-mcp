@@ -3,10 +3,20 @@
 
 HTTP (Streamable HTTP, MCP 2025-03-26 .. 2025-11-25 sessions):
   POST/GET/DELETE /servers/<name>/mcp
-  Every MCP session gets its own server process. It is started by the client's
-  initialize request and stopped when the client deletes the session, when the
-  process exits, or after the session has been idle (no request in flight and no
-  open GET stream) for the idle timeout.
+  Every MCP session gets its own server process. It is stopped when the client
+  deletes the session, when the process exits, or after the session has been
+  idle (no request in flight and no open GET stream) for the idle timeout.
+
+  Lazy start (default; --no-lazy turns it off): for a server with a discovery
+  cache (per server "cache": JSON file {"versions": {protocolVersion:
+  {"initialize": result, "tools/list": result, ...}}}, results of a fresh
+  process), the gateway answers initialize, ping and the cached list requests
+  (without cursor) itself, and starts the process only when the session first
+  needs it (tools/call, resources/read, ...): it replays the client's
+  initialize and notifications/initialized to it, then forwards as usual. A
+  protocol version missing from the cache is served by a process started at
+  initialize, and its answers are cached in memory for later sessions.
+  Sessions that never started a process are kept for --lazy-idle-timeout.
   GET /healthz   liveness, no authentication
   GET /status    servers and running sessions (JSON)
 
@@ -43,6 +53,10 @@ ROUTE = re.compile(r"^/servers/([A-Za-z0-9_.-]+)/mcp/?$")
 KEEPALIVE = 15          # seconds between SSE comments, also how dead clients are noticed
 MAX_BODY = 64 << 20
 CLOSED = object()       # queue sentinel: the session or stream ended
+LIST_METHODS = ("tools/list", "prompts/list", "resources/list", "resources/templates/list")
+# Methods a session can call without changing the server's state: while only
+# these were sent, list results are what a fresh process answers (cacheable).
+DISCOVERY = {"initialize", "ping", *LIST_METHODS}
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
 
@@ -52,6 +66,14 @@ def rpc_error(code, message, id=None):
 
 def id_key(id):
     return json.dumps(id, sort_keys=True)
+
+
+class Full(Exception):
+    """The server is at maxSessions."""
+
+
+class StartError(Exception):
+    """The server process could not be started or did not initialize."""
 
 
 def stop_process(proc, grace=5):
@@ -96,6 +118,16 @@ class Server:
         self.max_sessions = int(spec.get("maxSessions", defaults.max_sessions))
         self.idle_timeout = float(spec.get("idleTimeout", defaults.idle_timeout))
         self.tcp_port = spec.get("tcpPort")
+        self.cache = {}         # protocolVersion -> {"initialize": result, "<list method>": result}
+        if spec.get("cache") and defaults.lazy:
+            try:
+                with open(spec["cache"]) as f:
+                    self.cache = json.load(f)["versions"]
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                log.warning("%s: discovery cache %s not used: %s", name, spec["cache"], e)
+        # Only servers with a build-time cache (proven stable: two fresh
+        # processes answered alike) are started lazily and learn more versions.
+        self.lazy = bool(self.cache)
         self.sessions = {}      # HTTP session id -> Session
         self.instances = 0      # running processes: HTTP sessions and TCP connections
         self.lock = threading.Lock()
@@ -112,12 +144,36 @@ class Server:
         with self.lock:
             self.instances -= 1
 
+    def cached(self, version, method=None):
+        """The cached result of initialize (method None) or a list method, or None."""
+        with self.lock:
+            entry = self.cache.get(version) or {}
+            return entry.get(method or "initialize")
+
+    def learn(self, version, method, result):
+        """Cache a result of a fresh process for later sessions (lazy mode only)."""
+        if not self.lazy or not isinstance(result, dict):
+            return
+        with self.lock:
+            entry = self.cache.setdefault(version, {})
+            if method not in entry:
+                entry[method] = result
+                log.info("%s: cached %s for protocol version %s", self.name, method, version)
+
 
 class Session:
-    """An HTTP MCP session and the server process that serves it."""
+    """An HTTP MCP session and the server process that serves it (started by
+    start(), possibly long after the session was created: lazy mode)."""
 
-    def __init__(self, server):
+    def __init__(self, server, init_msg):
         self.server = server
+        self.init_msg = init_msg        # the client's initialize request
+        self.version = (init_msg.get("params") or {}).get("protocolVersion")
+        self.initialized = False        # client sent notifications/initialized
+        self.fresh = True               # only DISCOVERY methods forwarded so far
+        self.proc = None
+        self.reserved = False
+        self.start_lock = threading.Lock()
         self.id = uuid.uuid4().hex
         self.tag = f"{server.name}/{self.id[:8]}"
         self.lock = threading.Lock()
@@ -129,9 +185,60 @@ class Session:
         self.busy = 0
         self.last_used = time.monotonic()
         self.closed = threading.Event()
-        self.proc = spawn(server, self.tag)
+
+    def start(self):
+        """Reserve an instance and start the server process (Full, OSError,
+        ConnectionError if the session was closed meanwhile)."""
+        with self.lock:
+            if self.closed.is_set():
+                raise ConnectionError("session closed")
+            if not self.server.reserve():
+                raise Full()
+            self.reserved = True
+        try:
+            proc = spawn(self.server, self.tag)
+        except OSError:
+            with self.lock:
+                reserved, self.reserved = self.reserved, False
+            if reserved:
+                self.server.release()
+            raise
+        self.proc = proc
+        if self.closed.is_set():            # closed while spawning
+            stop_process(proc)
+            raise ConnectionError("session closed")
         log.info("[%s] started pid %d", self.tag, self.proc.pid)
         threading.Thread(target=self.read_stdout, daemon=True).start()
+
+    def ensure_started(self, timeout):
+        """Lazy mode: start the process on first need and replay the client's
+        handshake to it. Raises Full, StartError or ConnectionError."""
+        with self.start_lock:
+            if self.proc is not None:
+                return
+            if self.closed.is_set():
+                raise ConnectionError("session closed")
+            try:
+                self.start()
+            except OSError as e:
+                log.error("[%s] cannot start %s: %s", self.tag, self.server.command, e)
+                raise StartError(f"Cannot start MCP server: {e}")
+            init = {**self.init_msg, "id": f"mcp-gateway-init-{self.id}"}
+            q = queue.Queue()
+            self.expect([init["id"]], q)
+            try:
+                self.send([init])
+                msg = q.get(timeout=timeout)
+            except (ConnectionError, queue.Empty):
+                msg = CLOSED
+            self.forget([init["id"]])
+            if msg is CLOSED or "error" in msg:
+                log.error("[%s] did not initialize: %s", self.tag, "no answer" if msg is CLOSED else msg["error"])
+                self.close()
+                raise StartError("MCP server did not initialize")
+            log.info("[%s] started on first use", self.tag)
+            if self.initialized:
+                self.send([{"jsonrpc": "2.0", "method": "notifications/initialized"}])
 
     def read_stdout(self):
         for line in self.proc.stdout:
@@ -227,34 +334,38 @@ class Session:
         self.closed.set()
         with self.server.lock:
             self.server.sessions.pop(self.id, None)
-        self.server.release()
+        with self.lock:
+            reserved, self.reserved = self.reserved, False
+        if reserved:
+            self.server.release()
         with self.lock:
             queues = list(self.pending.values()) + self.post_streams + [self.get_stream]
             self.pending.clear()
         for q in {id(q): q for q in queues if q is not None}.values():
             q.put(CLOSED)
-        threading.Thread(target=stop_process, args=(self.proc,), daemon=True).start()
+        if self.proc is not None:
+            threading.Thread(target=stop_process, args=(self.proc,), daemon=True).start()
 
 
 class Gateway:
-    def __init__(self, servers, api_keys, allowed_origins, allowed_hosts, init_timeout):
+    def __init__(self, servers, api_keys, allowed_origins, allowed_hosts, init_timeout, lazy_idle_timeout):
         self.servers = servers
         self.api_keys = [k.encode() for k in api_keys]
         self.allowed_origins = set(allowed_origins)
         self.allowed_hosts = {h.lower() for h in allowed_hosts}
         self.init_timeout = init_timeout
+        self.lazy_idle_timeout = lazy_idle_timeout
 
     def reap(self):
         while True:
             time.sleep(10)
             for server in self.servers.values():
-                if not server.idle_timeout:
-                    continue
                 with server.lock:
                     sessions = list(server.sessions.values())
                 for s in sessions:
-                    if s.idle_for() > server.idle_timeout:
-                        log.info("[%s] idle for %ds, stopping", s.tag, server.idle_timeout)
+                    timeout = server.idle_timeout if s.proc is not None else self.lazy_idle_timeout
+                    if timeout and s.idle_for() > timeout:
+                        log.info("[%s] idle for %ds, stopping", s.tag, timeout)
                         s.close()
 
     def status(self):
@@ -262,12 +373,16 @@ class Gateway:
         for name, server in self.servers.items():
             with server.lock:
                 sessions = list(server.sessions.values())
+            running = [s for s in sessions if s.proc is not None]
             out[name] = {
                 "command": server.command,
                 "maxSessions": server.max_sessions,
+                "cachedVersions": sorted(server.cache),
                 "tcpPort": server.tcp_port,
-                "tcpConnections": server.instances - len(sessions),
-                "sessions": [{"id": s.id[:8], "pid": s.proc.pid, "busy": s.busy,
+                "tcpConnections": server.instances - len(running),
+                "running": len(running),
+                "notStarted": len(sessions) - len(running),
+                "sessions": [{"id": s.id[:8], "pid": s.proc.pid if s.proc else None, "busy": s.busy,
                               "getStream": s.get_stream is not None,
                               "idleSeconds": int(s.idle_for())} for s in sessions],
             }
@@ -279,7 +394,8 @@ class Gateway:
                 sessions = list(server.sessions.values())
             for s in sessions:
                 s.close()
-                stop_process(s.proc)
+                if s.proc is not None:
+                    stop_process(s.proc)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -459,29 +575,81 @@ class Handler(http.server.BaseHTTPRequestHandler):
         s = self.session_of(server)
         if s is None:
             return
+        batch = isinstance(body, list)
+        if s.proc is None:
+            if any(m.get("method") == "notifications/initialized" for m in msgs):
+                s.initialized = True
+            local = [self.local_answer(s, m) for m in requests]
+            if all(a is not None for a in local):
+                with s.lock:
+                    s.last_used = time.monotonic()
+                if not requests:
+                    return self.reply(202)      # other notifications mean nothing to a fresh server
+                return self.answer(local if batch else local[0])
+            ids = [m["id"] for m in requests]
+            try:
+                s.ensure_started(self.gw.init_timeout)
+            except Full:
+                return self.reply(503, rpc_error(-32000, f"Too many sessions for {server.name}", ids[0]))
+            except StartError as e:
+                return self.reply(502, rpc_error(-32603, str(e), ids[0]))
+            except ConnectionError:
+                return self.reply(404, rpc_error(-32001, "Session not found"))
+            # ensure_started replayed it already
+            msgs = [m for m in msgs if m.get("method") != "notifications/initialized"]
         if not requests:
             try:
                 s.send(msgs)
             except ConnectionError:
                 return self.reply(404, rpc_error(-32001, "Session not found"))
             return self.reply(202)
-        self.exchange(s, msgs, requests, isinstance(body, list))
+        self.exchange(s, msgs, requests, batch)
+
+    def local_answer(self, s, m):
+        """The response a session without a process gets from the gateway, or None."""
+        method = m.get("method")
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": m["id"], "result": {}}
+        if method in LIST_METHODS and not (m.get("params") or {}).get("cursor"):
+            result = s.server.cached(s.version, method)
+            if result is not None:
+                return {"jsonrpc": "2.0", "id": m["id"], "result": result}
+        return None
+
+    def answer(self, body, headers=()):
+        """A complete response: JSON, or one SSE event for SSE-only clients."""
+        accept = self.headers.get("Accept", "")
+        if "text/event-stream" in accept and "application/json" not in accept:
+            self.start_sse(headers)
+            for msg in body if isinstance(body, list) else [body]:
+                self.sse(msg)
+            self.end_sse()
+        else:
+            self.reply(200, body, headers)
 
     def initialize(self, server, msgs, requests):
         if len(requests) != 1:
             return self.reply(400, rpc_error(-32600, "Invalid Request: initialize must be sent alone"))
-        if not server.reserve():
-            return self.reply(503, rpc_error(-32000, f"Too many sessions for {server.name}"))
+        req = requests[0]
+        s = Session(server, req)
+        headers = [("Mcp-Session-Id", s.id)]
+        cached = server.cached(s.version) if server.lazy else None
+        if cached is not None:
+            with server.lock:
+                server.sessions[s.id] = s
+            log.info("[%s] opened, server starts on first use", s.tag)
+            return self.answer({"jsonrpc": "2.0", "id": req["id"], "result": cached}, headers)
         try:
-            s = Session(server)
+            s.start()
+        except Full:
+            return self.reply(503, rpc_error(-32000, f"Too many sessions for {server.name}"))
         except OSError as e:
-            server.release()
             log.error("[%s] cannot start %s: %s", server.name, server.command, e)
-            return self.reply(502, rpc_error(-32603, f"Cannot start MCP server: {e}", requests[0]["id"]))
+            return self.reply(502, rpc_error(-32603, f"Cannot start MCP server: {e}", req["id"]))
         with server.lock:
             server.sessions[s.id] = s
         q = queue.Queue()
-        ids = [requests[0]["id"]]
+        ids = [req["id"]]
         s.expect(ids, q)
         try:
             s.send(msgs)
@@ -492,21 +660,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s.close()
             err = msg if msg is not CLOSED else rpc_error(-32603, "MCP server did not initialize", ids[0])
             return self.reply(502 if msg is CLOSED else 200, err)
-        s.last_used = time.monotonic()
-        headers = [("Mcp-Session-Id", s.id)]
-        if "text/event-stream" in self.headers.get("Accept", "") and \
-                "application/json" not in self.headers.get("Accept", ""):
-            self.start_sse(headers)
-            self.sse(msg)
-            self.end_sse()
-        else:
-            self.reply(200, msg, headers)
+        with s.lock:
+            s.last_used = time.monotonic()
+        server.learn(s.version, "initialize", msg.get("result"))
+        self.answer(msg, headers)
 
     def exchange(self, s, msgs, requests, batch):
         """Send requests to the server process and answer with their responses."""
         ids = [m["id"] for m in requests]
         q = queue.Queue()
         use_sse = "text/event-stream" in self.headers.get("Accept", "")
+        # List results of a process that has only seen discovery requests are
+        # what any fresh process answers: cache those not cached yet.
+        with s.lock:
+            if any(m["method"] not in DISCOVERY for m in requests):
+                s.fresh = False
+            fresh = s.fresh
+        learn = {id_key(m["id"]): m["method"] for m in requests
+                 if fresh and m["method"] in LIST_METHODS and not (m.get("params") or {}).get("cursor")
+                 and s.server.lazy and s.server.cached(s.version, m["method"]) is None}
+
+        def seen(msg):
+            if learn and "method" not in msg and "id" in msg and id_key(msg["id"]) in learn:
+                s.server.learn(s.version, learn[id_key(msg["id"])], msg.get("result"))
         s.enter()
         s.expect(ids, q)
         if use_sse:
@@ -531,6 +707,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         break
                     if "method" not in msg and "id" in msg:
                         waiting.discard(id_key(msg["id"]))
+                        seen(msg)
                     self.sse(msg)
                 self.end_sse()
             else:
@@ -541,6 +718,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                         responses += [rpc_error(-32603, "MCP server process exited", json.loads(k)) for k in waiting]
                         break
                     waiting.discard(id_key(msg["id"]))
+                    seen(msg)
                     responses.append(msg)
                 self.reply(200, responses if batch else responses[0])
         except OSError:
@@ -629,7 +807,7 @@ def main():
     env = os.environ.get
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("--config", default=env("MCP_GATEWAY_CONFIG", "/etc/mcp-gateway/servers.json"),
-                   help='JSON file: {"mcpServers": {name: {command, args, env, cwd, maxSessions, idleTimeout, tcpPort}}}')
+                   help='JSON file: {"mcpServers": {name: {command, args, env, cwd, maxSessions, idleTimeout, tcpPort, cache}}}')
     p.add_argument("--host", default=env("MCP_GATEWAY_HOST", "0.0.0.0"))
     p.add_argument("--port", type=int, default=int(env("MCP_GATEWAY_PORT", "8080")))
     p.add_argument("--tcp-host", default=env("MCP_TCP_HOST", "0.0.0.0"), help="address of the raw TCP listeners")
@@ -638,6 +816,11 @@ def main():
     p.add_argument("--max-sessions", type=int, default=int(env("MCP_MAX_SESSIONS", "16")),
                    help="running instances per server, HTTP sessions plus TCP connections (0: unlimited)")
     p.add_argument("--init-timeout", type=float, default=float(env("MCP_INIT_TIMEOUT", "60")))
+    p.add_argument("--lazy", action=argparse.BooleanOptionalAction,
+                   default=env("MCP_LAZY", "1").lower() not in ("0", "false", "no", "off"),
+                   help="answer discovery from the servers' caches, start processes on first use (default: on)")
+    p.add_argument("--lazy-idle-timeout", type=float, default=float(env("MCP_LAZY_IDLE_TIMEOUT", "86400")),
+                   help="forget a session that never started a process after this many idle seconds (0: never)")
     p.add_argument("--api-key-file", default=env("MCP_API_KEY_FILE"), help="accepted API keys, one per line")
     p.add_argument("--allowed-origin", action="append",
                    default=[o for o in env("MCP_ALLOWED_ORIGINS", "").split(",") if o])
@@ -654,7 +837,7 @@ def main():
         with open(args.api_key_file) as f:
             keys += [line.strip() for line in f if line.strip()]
     servers = load_servers(args.config, args)
-    gw = Gateway(servers, keys, args.allowed_origin, args.allowed_host, args.init_timeout)
+    gw = Gateway(servers, keys, args.allowed_origin, args.allowed_host, args.init_timeout, args.lazy_idle_timeout)
     Handler.gw = gw
 
     for server in servers.values():
@@ -673,8 +856,9 @@ def main():
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
-    for name in servers:
-        log.info("%s: http://%s:%d/servers/%s/mcp, one process per session", name, args.host, args.port, name)
+    for name, server in servers.items():
+        log.info("%s: http://%s:%d/servers/%s/mcp, one process per session, started %s", name, args.host,
+                 args.port, name, "on first use" if server.lazy else "at initialize")
     log.info("idle timeout %ss, max %s instances per server, API key %s",
              args.idle_timeout or "off", args.max_sessions or "unlimited", "required" if keys else "off")
     httpd.serve_forever()

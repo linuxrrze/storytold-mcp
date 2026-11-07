@@ -2,8 +2,10 @@
 # Render the named-server config for this WORK_DIR, then serve every
 # detected stdio MCP server over streamable HTTP via mcp-gateway:
 #   http://<container>:8080/servers/<app>/mcp
-# Each MCP session gets its own server process, started by the client's
-# initialize and stopped when the session ends or idles (MCP_IDLE_TIMEOUT).
+# Each MCP session gets its own server process, started on the session's
+# first real request (initialize and tool lists come from the build-time
+# discovery cache, MCP_LAZY) and stopped when the session ends or idles
+# (MCP_IDLE_TIMEOUT).
 # Kept identical in storytold-mcp/ and solidcraft-mcp/ -- edit both.
 set -euo pipefail
 

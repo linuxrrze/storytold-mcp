@@ -2,7 +2,11 @@
 """Manage the stdio MCP servers that mcp-gateway serves over HTTP.
 
   mcp-servers detect           (build time) probe every installed <app>-cli
-                               with an MCP `initialize`, write APPS_FILE
+                               with an MCP `initialize`, write APPS_FILE and
+                               the discovery cache CACHE_DIR/<app>.json
+                               (initialize result + tools/prompts/resources
+                               lists per protocol version, so mcp-gateway can
+                               answer them without starting the server)
   mcp-servers render           (container start) write the mcp-gateway
                                --config file for APPS_FILE,
                                with app-args.conf expanded for this WORK_DIR
@@ -16,6 +20,7 @@ import json
 import os
 import selectors
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -23,14 +28,21 @@ import time
 CONF_DIR = "/etc/mcp-gateway"
 APPS_FILE = f"{CONF_DIR}/apps.list"
 ARGS_FILE = f"{CONF_DIR}/app-args.conf"
+CACHE_DIR = f"{CONF_DIR}/cache"
 SERVERS_FILE = os.environ.get("MCP_SERVERS_FILE", "/tmp/mcp-servers.json")
 PROBE_TIMEOUT = 30
-
-INIT = json.dumps({
-    "jsonrpc": "2.0", "id": 1, "method": "initialize",
-    "params": {"protocolVersion": "2025-06-18", "capabilities": {},
-               "clientInfo": {"name": "mcp-servers-probe", "version": "1"}},
-})
+PROBE_VERSION = "2025-06-18"
+# Cached per requested protocol version: the initialize result (and in
+# principle the lists) can differ by version. mcp-gateway learns any other
+# version at runtime, from the first session that asks for it.
+CACHE_VERSIONS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+# list method -> (capability that announces it, result key of its items)
+LIST_METHODS = {
+    "tools/list": ("tools", "tools"),
+    "prompts/list": ("prompts", "prompts"),
+    "resources/list": ("resources", "resources"),
+    "resources/templates/list": ("resources", "resourceTemplates"),
+}
 
 
 def app_args():
@@ -49,36 +61,119 @@ def command(app, extra):
     return [f"/usr/bin/{app}-cli", "mcp", *(os.path.expandvars(a) for a in extra)]
 
 
+class Client:
+    """A minimal stdio MCP client: one server process, requests in sequence."""
+
+    def __init__(self, cmd, cwd=None):
+        self.p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, cwd=cwd)
+        self.sel = selectors.DefaultSelector()
+        self.sel.register(self.p.stdout, selectors.EVENT_READ)
+        self.next_id = 0
+
+    def write(self, msg):
+        self.p.stdin.write(json.dumps({"jsonrpc": "2.0", **msg}) + "\n")
+        self.p.stdin.flush()
+
+    def call(self, method, params):
+        """The response message, or None (timeout, exit, broken pipe)."""
+        self.next_id += 1
+        try:
+            self.write({"id": self.next_id, "method": method, "params": params})
+            deadline = time.monotonic() + PROBE_TIMEOUT
+            while (left := deadline - time.monotonic()) > 0 and self.sel.select(left):
+                line = self.p.stdout.readline()
+                if not line:
+                    return None
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue  # stray log line on stdout
+                if isinstance(msg, dict) and msg.get("id") == self.next_id and "method" not in msg:
+                    return msg
+        except OSError:
+            pass
+        return None
+
+    def initialize(self, version):
+        """The initialize result for this protocol version, or None."""
+        msg = self.call("initialize", {
+            "protocolVersion": version, "capabilities": {},
+            "clientInfo": {"name": "mcp-servers-probe", "version": "1"}})
+        result = msg.get("result") if msg else None
+        if not isinstance(result, dict):
+            return None
+        try:
+            self.write({"method": "notifications/initialized"})
+        except OSError:
+            return None
+        return result
+
+    def list_all(self, method, key):
+        """One result holding every page of a list method, or None."""
+        items, params = [], {}
+        for _ in range(100):
+            msg = self.call(method, params)
+            result = msg.get("result") if msg else None
+            if not isinstance(result, dict) or not isinstance(result.get(key), list):
+                return None
+            items += result[key]
+            if not result.get("nextCursor"):
+                return {**result, key: items}
+            params = {"cursor": result["nextCursor"]}
+        return None
+
+    def close(self):
+        # stdin stays open until here: some servers exit on EOF before answering.
+        self.p.kill()
+        self.p.wait()
+
+
 def probe(cmd):
     """True if cmd answers an MCP initialize on stdio within PROBE_TIMEOUT."""
     try:
-        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                             stderr=subprocess.DEVNULL, text=True)
+        c = Client(cmd)
     except OSError:
         return False
     try:
-        # stdin stays open: some servers exit on EOF before answering.
-        p.stdin.write(INIT + "\n")
-        p.stdin.flush()
-        sel = selectors.DefaultSelector()
-        sel.register(p.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + PROBE_TIMEOUT
-        while (left := deadline - time.monotonic()) > 0 and sel.select(left):
-            line = p.stdout.readline()
-            if not line:
-                return False
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue  # stray log line on stdout
-            if isinstance(msg, dict) and msg.get("id") == 1:
-                return "result" in msg
-        return False
-    except (BrokenPipeError, OSError):
-        return False
+        return c.initialize(PROBE_VERSION) is not None
     finally:
-        p.kill()
-        p.wait()
+        c.close()
+
+
+def discover(cmd, cwd):
+    """{protocolVersion: {"initialize": result, "<list method>": result}} of a
+    fresh server, for each version in CACHE_VERSIONS it accepts -- what
+    mcp-gateway answers from without starting a process. Lists are probed only
+    when their capability is announced; one that fails is left out (sessions
+    asking for it start the server). Returns (cache, reason); the cache is
+    empty if a second fresh server answers differently (process-specific
+    values, e.g. a per-process autosave folder in the instructions)."""
+    def fresh(version):
+        try:
+            c = Client(cmd, cwd)
+        except OSError:
+            return None
+        try:
+            init = c.initialize(version)
+            if init is None:
+                return None
+            entry = {"initialize": init}
+            caps = init.get("capabilities") or {}
+            for method, (cap, key) in LIST_METHODS.items():
+                if cap in caps and (result := c.list_all(method, key)) is not None:
+                    entry[method] = result
+            return entry
+        finally:
+            c.close()
+
+    cache = {v: e for v in CACHE_VERSIONS if (e := fresh(v)) is not None}
+    if not cache:
+        return {}, "no protocol version answered"
+    last = list(cache)[-1]
+    if fresh(last) != cache[last]:
+        return {}, "a second server process answered differently"
+    return cache, None
 
 
 def detect():
@@ -105,6 +200,36 @@ def detect():
         sys.exit("detect: no app answered an MCP initialize")
     with open(APPS_FILE, "w") as f:
         f.write("".join(a + "\n" for a in served))
+    write_cache(served, conf)
+
+
+def write_cache(apps, conf):
+    """Probe the served apps as they run in the container -- with the image's
+    real work dir (MCP_CACHE_WORK_DIR) as WORK_DIR and cwd, since some apps
+    name their allowed folders in instructions or tool descriptions -- and
+    write CACHE_DIR/<app>.json. `render` uses a cache only while the
+    container's WORK_DIR is still that dir."""
+    work_dir = os.environ.get("MCP_CACHE_WORK_DIR") or os.environ["WORK_DIR"]
+    created = not os.path.isdir(work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    probe_work_dir, os.environ["WORK_DIR"] = os.environ["WORK_DIR"], work_dir
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    try:
+        for app in apps:
+            cache, reason = discover(command(app, conf.get(app, [])), work_dir)
+            if not cache:
+                print(f"detect: {app}: not cached ({reason}), its sessions start the server at initialize")
+                continue
+            with open(f"{CACHE_DIR}/{app}.json", "w") as f:
+                json.dump({"workDir": work_dir, "versions": cache}, f, separators=(",", ":"))
+            lists = [f"{m} {len(r[LIST_METHODS[m][1]])}"
+                     for m, r in next(iter(cache.values())).items() if m in LIST_METHODS]
+            print(f"detect: {app}: cached protocol versions {' '.join(cache)}; "
+                  f"{', '.join(lists) or 'no lists'}")
+    finally:
+        os.environ["WORK_DIR"] = probe_work_dir
+        if created:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def served_apps():
@@ -112,11 +237,28 @@ def served_apps():
         return f.read().split()
 
 
+def usable_cache(app):
+    """Path of the app's discovery cache, if it was made for this WORK_DIR."""
+    path = f"{CACHE_DIR}/{app}.json"
+    try:
+        with open(path) as f:
+            work_dir = json.load(f).get("workDir")
+    except (OSError, ValueError):
+        return None
+    if work_dir != os.environ["WORK_DIR"]:
+        print(f"mcp-servers: {app}: discovery cache was made for WORK_DIR={work_dir}, not used")
+        return None
+    return path
+
+
 def render():
     conf = app_args()
-    servers = {app: {"command": cmd[0], "args": cmd[1:]}
-               for app in served_apps()
-               for cmd in [command(app, conf.get(app, []))]}
+    servers = {}
+    for app in served_apps():
+        cmd = command(app, conf.get(app, []))
+        servers[app] = {"command": cmd[0], "args": cmd[1:]}
+        if (cache := usable_cache(app)):
+            servers[app]["cache"] = cache
     with open(SERVERS_FILE, "w") as f:
         json.dump({"mcpServers": servers}, f, indent=2)
     print(f"mcp-servers: serving {' '.join(servers)} on :8080/servers/<app>/mcp")

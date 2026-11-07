@@ -86,8 +86,11 @@ COPY --chmod=755 files/mcp-servers files/mcp-gateway /usr/local/bin/
 COPY --chmod=755 files/entrypoint.sh /
 
 # Probe every installed <app>-cli once, so the served set is fixed per
-# image (and visible in the build log). The probe's WORK_DIR is a throwaway.
-RUN WORK_DIR=/tmp/mcp-probe mcp-servers detect \
+# image (and visible in the build log). The probe's WORK_DIR is a throwaway;
+# the discovery cache (initialize + tool lists, so mcp-gateway starts a
+# server only on first use) is probed with the real WORK_DIR, as some apps
+# name their allowed folders in it.
+RUN MCP_CACHE_WORK_DIR="$WORK_DIR" WORK_DIR=/tmp/mcp-probe mcp-servers detect \
  && rm -rf /tmp/mcp-probe /home/mcp/* /home/mcp/.[!.]*
 
 WORKDIR /home/sandbox/work

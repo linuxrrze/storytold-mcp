@@ -45,9 +45,10 @@ services:
     <<: *mcp
     image: git.linux-ng.de/marcel/storytold-mcp:latest
     container_name: storytold-mcp
-    # Engines start per MCP session: a client (claude/opencode) connecting
-    # to all 14 apps starts 14 processes (~5-20 MB each idle), per client.
-    # Cap them with MCP_MAX_SESSIONS (per app) in .env.
+    # Engines start per MCP session, on its first tool call (connecting and
+    # listing tools is answered from a cache): a client (claude/opencode)
+    # with all apps configured only runs the apps it actually uses, ~5-20 MB
+    # each idle. Cap them with MCP_MAX_SESSIONS (per app) in .env.
 
   solidcraft-mcp:
     <<: *mcp

@@ -20,16 +20,29 @@ session**, started on demand:
 | Endpoint | |
 | --- | --- |
 | `http://storytold-mcp:8080/servers/<app>/mcp` | streamable HTTP |
-| `http://storytold-mcp:8080/status` | running sessions per app, with PIDs (JSON) |
+| `http://storytold-mcp:8080/status` | sessions per app (`running` with PIDs, `notStarted`), cached protocol versions (JSON) |
 | `http://storytold-mcp:8080/healthz` | liveness (healthcheck) |
 
-- A client's `initialize` starts a fresh `<app>-cli mcp` for that session
-  (3-140 ms), so clients never see each other's open documents.
+- Every session gets its own fresh `<app>-cli mcp` (3-140 ms to start), so
+  clients never see each other's open documents.
+- **Lazy start** (`MCP_LAZY=1`, the default): `initialize`, `ping` and the
+  tool/prompt/resource lists are answered from a discovery cache baked
+  into the image (`/etc/mcp-gateway/cache/<app>.json`, the answers of a
+  fresh process). The session's process starts on its first other request,
+  usually the first tool call. The gateway replays the client's
+  `initialize` to it first, so the client never notices. After that
+  everything goes to the process, as before. A client asking for a
+  protocol version not in the cache gets its process at `initialize`, and
+  those answers are cached in memory for later sessions. Sessions that
+  never started a process cost nothing and are kept for
+  `MCP_LAZY_IDLE_TIMEOUT` seconds (default 86400) without a request.
+  `MCP_LAZY=0` starts every session's process at `initialize`.
 - The process is stopped when the client deletes the session, when it
   exits, or after `MCP_IDLE_TIMEOUT` seconds (default 1800) with no request
   running and the client's event stream closed. Clients reconnecting after
   that get a new session -- documents not saved to the work dir are gone.
-- `MCP_MAX_SESSIONS` (default 16) caps the running processes per app;
+- `MCP_MAX_SESSIONS` (default 16) caps the running processes per app
+  (sessions that never started one don't count);
   further sessions get HTTP 503.
 - Only the session-based protocol versions (up to 2025-11-25) are offered:
   the session-less 2026-07-28 protocol would need a process per request,
@@ -50,12 +63,12 @@ to be added by hand.
 | --- | --- | --- |
 | `docker/Dockerfile` | yes | Adds the storytold repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, then probes which apps serve MCP. |
 | `docker/files/mcp-gateway` | yes | The HTTP gateway: streamable HTTP per session, idle reaper, Host/Origin checks, optional API key (`MCP_API_KEY`) and per-server raw TCP (unused here). `mcp-gateway --help` lists its options. Identical copy in `solidcraft-mcp/`. |
-| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in `solidcraft-mcp/`. |
+| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`; then the discovery cache, see [Discovery cache](#discovery-cache)), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in `solidcraft-mcp/`. |
 | `docker/files/app-args.conf` | yes | Per-app `mcp` flags -- mostly the automation roots confining file access to the work dir. |
 | `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-gateway. Identical copy in `solidcraft-mcp/`. |
 | `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app) CI last built; compared against the repo index. Updated automatically by CI. |
 | `.storytold-mcp-base-digest` | yes | Registry digest of the `ubuntu:26.04` base image the last build used. Updated automatically by CI. |
-| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`) and `TZ`. No secrets. |
+| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`, `MCP_LAZY`, `MCP_LAZY_IDLE_TIMEOUT`) and `TZ`. No secrets. |
 | `docker-compose.yml.sample` | no | Sanitized hub compose for storytold-mcp + solidcraft-mcp. The real file is gitignored. |
 
 ## Usage
@@ -91,10 +104,11 @@ docker compose up -d
 - **User:** the containers run as `PUID:PGID` (codingenv's), so files they
   write into the work dir are yours. The entrypoint aborts if the work dir
   is missing or not writable for that uid.
-- **Resources:** nothing runs until a client connects. claude and opencode
-  initialize every configured server when they start, so one client with
-  all 14 apps configured starts 14 processes (~5-20 MB each idle); every
-  further client starts its own. Rendering (screenshots, previews) runs on
+- **Resources:** nothing runs until a tool is called. claude and opencode
+  initialize every configured server and list its tools when they start.
+  With lazy start that costs no process, so a client with all apps
+  configured only runs the apps it actually calls (~5-20 MB each idle).
+  Every client gets its own. Rendering (screenshots, previews) runs on
   the CPU via Mesa's lavapipe -- no GPU or display needed; renders go to the
   `/tmp` tmpfs (10 GB limit in the compose sample), shared by all sessions.
 - **Concurrent instances:** checked for every app: several `<app>-cli mcp`
@@ -135,6 +149,57 @@ docker compose exec storytold-mcp cat /etc/mcp-gateway/versions.txt  # package v
 docker compose exec storytold-mcp cat /etc/mcp-gateway/apps.list     # served apps
 docker compose exec storytold-mcp curl -s localhost:8080/status      # running sessions
 ```
+
+## Discovery cache
+
+`mcp-servers detect` writes it at build time, after the served apps are
+known. For each app and each protocol version in `CACHE_VERSIONS`
+(2024-11-05 .. 2025-11-25) it starts a fresh process and records the
+`initialize` result and every list the server announces (`tools/list`,
+`prompts/list`, `resources/list`, `resources/templates/list`, all pages
+merged). Some apps name their allowed folders in instructions or tool
+descriptions, so the probe runs with the image's real `WORK_DIR` (passed
+in by the Dockerfile as `MCP_CACHE_WORK_DIR`). `mcp-servers render` passes
+a cache to the gateway only while the container's `WORK_DIR` is still that
+dir. An app whose second fresh process answers differently is **not
+cached** (e.g. a per-process autosave folder in effectcraft's
+instructions); its sessions start at `initialize`, as before. The build
+log shows which apps got cached and how many tools each has. The cache is
+part of the image, so a rebuild (new app versions) replaces it.
+
+Assumption: a server's discovery answers depend neither on the client's
+`initialize` parameters (`clientInfo`, capabilities) nor on anything that
+differs between build and container other than `WORK_DIR`. Once a
+session's process runs, all lists come from it live.
+
+### Alternatives considered
+
+The gateway's own lazy start was chosen after looking at existing tools
+(November 2026):
+
+- **mcp-later**, **dsh-lazy-mcp**: same idea (cached discovery, spawn on
+  first call), but as stdio wrappers on the client side -- they would
+  have to be set up in every client and still need a process per session
+  behind them.
+- **FastMCP proxy**: connects upstream on the first `initialize`, so it
+  isn't lazy past the handshake.
+- **Docker MCP Gateway**: one container per server, removed after each
+  call unless `--long-lived`. Tool metadata comes from its catalog. It is
+  a Docker CLI plugin with no documented Podman support, and short-lived
+  containers lose the apps' in-memory documents between calls.
+- **ToolHive** (Docker or Podman): isolates each *server* from the host
+  in a container, not *sessions* from each other.
+- **ContextForge, MetaMCP, 1mcp**: aggregators with long-lived upstreams
+  shared by all clients -- exactly the shared state the gateway avoids.
+
+**A container per session (podman)** was ruled out for now. Nested
+rootless podman needs `/dev/fuse`, subuids and relaxed seccomp/AppArmor.
+Mounting the host's podman socket instead gives the gateway root on the
+host. Starting a session would take ~0.3-1 s instead of 3-140 ms, and
+the work dir would need per-container mounts with uid mapping. Its gains
+(a memory/CPU cap per session, a private `/tmp`) would be cheaper with
+`setrlimit` in the gateway's `spawn()`, if a runaway session ever becomes
+a problem.
 
 ## Build & version tracking
 

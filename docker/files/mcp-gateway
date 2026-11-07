@@ -17,6 +17,10 @@ HTTP (Streamable HTTP, MCP 2025-03-26 .. 2025-11-25 sessions):
   protocol version missing from the cache is served by a process started at
   initialize, and its answers are cached in memory for later sessions.
   Sessions that never started a process are kept for --lazy-idle-timeout.
+
+Every --stats-interval seconds (default 60) one log line reports the active
+MCP connections (HTTP sessions + raw TCP connections) and running server
+processes, in total and per server.
   GET /healthz   liveness, no authentication
   GET /status    servers and running sessions (JSON)
 
@@ -367,6 +371,28 @@ class Gateway:
                     if timeout and s.idle_for() > timeout:
                         log.info("[%s] idle for %ds, stopping", s.tag, timeout)
                         s.close()
+
+    def counts(self):
+        """server name -> (connections, processes): HTTP sessions plus TCP
+        connections, and the running processes among them."""
+        out = {}
+        for name, server in self.servers.items():
+            with server.lock:
+                sessions = list(server.sessions.values())
+                instances = server.instances
+            running = sum(1 for s in sessions if s.reserved)
+            tcp = instances - running
+            out[name] = (len(sessions) + tcp, instances)
+        return out
+
+    def report(self, interval):
+        while True:
+            time.sleep(interval)
+            counts = self.counts()
+            per = ", ".join(f"{n} {c}/{p}" for n, (c, p) in counts.items() if c or p)
+            log.info("stats: %d MCP connections, %d processes%s",
+                     sum(c for c, _ in counts.values()), sum(p for _, p in counts.values()),
+                     f" (connections/processes: {per})" if per else "")
 
     def status(self):
         out = {}
@@ -819,6 +845,8 @@ def main():
     p.add_argument("--lazy", action=argparse.BooleanOptionalAction,
                    default=env("MCP_LAZY", "1").lower() not in ("0", "false", "no", "off"),
                    help="answer discovery from the servers' caches, start processes on first use (default: on)")
+    p.add_argument("--stats-interval", type=float, default=float(env("MCP_STATS_INTERVAL", "60")),
+                   help="log the number of MCP connections and processes every this many seconds (0: never)")
     p.add_argument("--lazy-idle-timeout", type=float, default=float(env("MCP_LAZY_IDLE_TIMEOUT", "86400")),
                    help="forget a session that never started a process after this many idle seconds (0: never)")
     p.add_argument("--api-key-file", default=env("MCP_API_KEY_FILE"), help="accepted API keys, one per line")
@@ -849,6 +877,8 @@ def main():
 
     httpd = HTTPServer((args.host, args.port), Handler)
     threading.Thread(target=gw.reap, daemon=True).start()
+    if args.stats_interval > 0:
+        threading.Thread(target=gw.report, args=(args.stats_interval,), daemon=True).start()
 
     def stop(signum, frame):
         log.info("signal %d, stopping all sessions", signum)

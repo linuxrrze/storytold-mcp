@@ -37,6 +37,9 @@ session**, started on demand:
   never started a process cost nothing and are kept for
   `MCP_LAZY_IDLE_TIMEOUT` seconds (default 86400) without a request.
   `MCP_LAZY=0` starts every session's process at `initialize`.
+- Once a minute (`MCP_STATS_INTERVAL`, 0 = off) the log reports the active
+  MCP connections and running processes, e.g. `stats: 3 MCP connections,
+  2 processes (connections/processes: pdfcraft 2/1, wordcraft 1/1)`.
 - The process is stopped when the client deletes the session, when it
   exits, or after `MCP_IDLE_TIMEOUT` seconds (default 1800) with no request
   running and the client's event stream closed. Clients reconnecting after
@@ -68,7 +71,7 @@ to be added by hand.
 | `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-gateway. Identical copy in `solidcraft-mcp/`. |
 | `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app) CI last built; compared against the repo index. Updated automatically by CI. |
 | `.storytold-mcp-base-digest` | yes | Registry digest of the `ubuntu:26.04` base image the last build used. Updated automatically by CI. |
-| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`, `MCP_LAZY`, `MCP_LAZY_IDLE_TIMEOUT`) and `TZ`. No secrets. |
+| `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`, `MCP_LAZY`, `MCP_LAZY_IDLE_TIMEOUT`, `MCP_STATS_INTERVAL`) and `TZ`. No secrets. |
 | `docker-compose.yml.sample` | no | Sanitized hub compose for storytold-mcp + solidcraft-mcp. The real file is gitignored. |
 
 ## Usage

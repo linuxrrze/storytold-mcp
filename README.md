@@ -38,8 +38,19 @@ session**, started on demand:
   `MCP_LAZY_IDLE_TIMEOUT` seconds (default 86400) without a request.
   `MCP_LAZY=0` starts every session's process at `initialize`.
 - Once a minute (`MCP_STATS_INTERVAL`, 0 = off) the log reports the active
-  MCP connections and running processes, e.g. `stats: 3 MCP connections,
-  2 processes (connections/processes: pdfcraft 2/1, wordcraft 1/1)`.
+  MCP connections, running processes, their memory and CPU, in total and
+  per app, e.g. `stats: 3 MCP connections, 2 processes, 170 MB, 12% CPU
+  (per app connections/processes memory CPU: pdfcraft 2/1 85 MB 3%;
+  wordcraft 1/1 85 MB 9%)`.
+  - **Memory** is PSS: shared pages (Mesa and other libraries) are split
+    between the processes sharing them, so the per-app numbers add up to
+    real usage. It includes processes a server forked. It doesn't include
+    renders on the `/tmp` tmpfs.
+  - **CPU** is the average since the previous line, where 100% is one core,
+    so a server rendering on several cores can show more.
+  - **Limits:** processes that start and exit between two lines are not
+    seen, and their CPU time is not counted.
+  - `docker stats` shows the whole container.
 - The process is stopped when the client deletes the session, when it
   exits, or after `MCP_IDLE_TIMEOUT` seconds (default 1800) with no request
   running and the client's event stream closed. Clients reconnecting after

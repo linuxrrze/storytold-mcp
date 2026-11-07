@@ -19,8 +19,9 @@ HTTP (Streamable HTTP, MCP 2025-03-26 .. 2025-11-25 sessions):
   Sessions that never started a process are kept for --lazy-idle-timeout.
 
 Every --stats-interval seconds (default 60) one log line reports the active
-MCP connections (HTTP sessions + raw TCP connections) and running server
-processes, in total and per server.
+MCP connections (HTTP sessions + raw TCP connections), running server
+processes, their memory (PSS, including processes they forked) and CPU usage
+since the previous line (100% = one core), in total and per server.
   GET /healthz   liveness, no authentication
   GET /status    servers and running sessions (JSON)
 
@@ -62,6 +63,12 @@ LIST_METHODS = ("tools/list", "prompts/list", "resources/list", "resources/templ
 # these were sent, list results are what a fresh process answers (cacheable).
 DISCOVERY = {"initialize", "ping", *LIST_METHODS}
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# Every server process leads its own process group (start_new_session), so a
+# group holds the process and everything it forked: group id -> server name.
+GROUPS = {}
+GROUPS_LOCK = threading.Lock()
 
 
 def rpc_error(code, message, id=None):
@@ -102,8 +109,41 @@ def spawn(server, tag):
     proc = subprocess.Popen(
         server.command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=env, cwd=server.cwd, start_new_session=True)
+    with GROUPS_LOCK:
+        GROUPS[proc.pid] = server.name
     threading.Thread(target=pipe_stderr, args=(proc, tag), daemon=True).start()
     return proc
+
+
+def read_proc_stats(groups):
+    """pid -> (process group, CPU ticks used, memory bytes) of every process in
+    one of the groups. Memory is PSS (shared pages split between the processes
+    sharing them), RSS where smaps_rollup can't be read."""
+    out = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                # comm (2nd field) may contain spaces and parens: split after the last ')'
+                fields = f.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue        # exited meanwhile
+        pgrp = int(fields[2])
+        if pgrp not in groups:
+            continue
+        ticks = int(fields[11]) + int(fields[12])           # utime + stime
+        mem = int(fields[21]) * PAGE_SIZE                    # rss
+        try:
+            with open(f"/proc/{entry}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith("Pss:"):
+                        mem = int(line.split()[1]) * 1024
+                        break
+        except (OSError, ValueError):
+            pass
+        out[int(entry)] = (pgrp, ticks, mem)
+    return out
 
 
 def pipe_stderr(proc, tag):
@@ -385,14 +425,41 @@ class Gateway:
             out[name] = (len(sessions) + tcp, instances)
         return out
 
+    def usage(self, prev):
+        """server name -> (memory bytes, CPU ticks since the previous call) of
+        its processes and their descendants. prev: pid -> ticks, updated."""
+        with GROUPS_LOCK:
+            groups = dict(GROUPS)
+        procs = read_proc_stats(groups)
+        with GROUPS_LOCK:       # forget groups whose processes are all gone
+            for g in set(groups) - {pgrp for pgrp, _, _ in procs.values()}:
+                GROUPS.pop(g, None)
+        out = {}
+        for pid, (pgrp, ticks, mem) in procs.items():
+            # A pid missing from prev started since then: all its ticks are new.
+            delta = ticks - prev.get(pid, 0)
+            m, t = out.get(groups[pgrp], (0, 0))
+            out[groups[pgrp]] = (m + mem, t + (delta if delta >= 0 else ticks))
+        prev.clear()
+        prev.update({pid: ticks for pid, (_, ticks, _) in procs.items()})
+        return out
+
     def report(self, interval):
+        prev, last = {}, time.monotonic()
         while True:
             time.sleep(interval)
-            counts = self.counts()
-            per = ", ".join(f"{n} {c}/{p}" for n, (c, p) in counts.items() if c or p)
-            log.info("stats: %d MCP connections, %d processes%s",
+            now = time.monotonic()
+            counts, usage = self.counts(), self.usage(prev)
+            elapsed, last = now - last, now
+
+            def fmt(mem, ticks, sep):
+                return f"{mem / 2**20:.0f} MB{sep}{100 * ticks / CLK_TCK / elapsed:.0f}%"
+            per = "; ".join(f"{n} {c}/{p} {fmt(*usage.get(n, (0, 0)), ' ')}"
+                            for n, (c, p) in counts.items() if c or p or n in usage)
+            log.info("stats: %d MCP connections, %d processes, %s CPU%s",
                      sum(c for c, _ in counts.values()), sum(p for _, p in counts.values()),
-                     f" (connections/processes: {per})" if per else "")
+                     fmt(sum(m for m, _ in usage.values()), sum(t for _, t in usage.values()), ", "),
+                     f" (per app connections/processes memory CPU: {per})" if per else "")
 
     def status(self):
         out = {}
@@ -846,7 +913,7 @@ def main():
                    default=env("MCP_LAZY", "1").lower() not in ("0", "false", "no", "off"),
                    help="answer discovery from the servers' caches, start processes on first use (default: on)")
     p.add_argument("--stats-interval", type=float, default=float(env("MCP_STATS_INTERVAL", "60")),
-                   help="log the number of MCP connections and processes every this many seconds (0: never)")
+                   help="log MCP connections, processes and their memory/CPU every this many seconds (0: never)")
     p.add_argument("--lazy-idle-timeout", type=float, default=float(env("MCP_LAZY_IDLE_TIMEOUT", "86400")),
                    help="forget a session that never started a process after this many idle seconds (0: never)")
     p.add_argument("--api-key-file", default=env("MCP_API_KEY_FILE"), help="accepted API keys, one per line")

@@ -37,6 +37,18 @@ session**, started on demand:
   never started a process cost nothing and are kept for
   `MCP_LAZY_IDLE_TIMEOUT` seconds (default 86400) without a request.
   `MCP_LAZY=0` starts every session's process at `initialize`.
+- The log has one `opened by <client> <version> (protocol …)` line per
+  session and one `closed: <reason>; open <duration>, <n> tool calls, …`
+  line when it ends. The reasons are:
+  - `deleted by client`
+  - `idle for more than …`
+  - `server process ended on its own: exit code N` / `killed by SIGSEGV`
+  - `server did not initialize: …`
+  - `cannot write to the server process: …`
+  - `gateway shutting down`
+
+  A process the gateway stops gets its own `pid N stopped: …` line. A
+  process that ignores SIGTERM is logged and sent SIGKILL after 5 s.
 - Once a minute (`MCP_STATS_INTERVAL`, 0 = off) the log reports the active
   MCP connections, running processes, their memory and CPU, in total and
   per app, e.g. `stats: 3 MCP connections, 2 processes, 170 MB, 12% CPU

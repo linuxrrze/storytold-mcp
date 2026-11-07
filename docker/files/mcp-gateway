@@ -87,7 +87,28 @@ class StartError(Exception):
     """The server process could not be started or did not initialize."""
 
 
-def stop_process(proc, grace=5):
+def exit_text(code):
+    """A process's returncode in words: "exit code 1", "killed by SIGSEGV"."""
+    if code is None:
+        return "still running"
+    if code < 0:
+        try:
+            return f"killed by {signal.Signals(-code).name}"
+        except ValueError:
+            return f"killed by signal {-code}"
+    return f"exit code {code}"
+
+
+def duration(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{s // 60 % 60:02d}m"
+
+
+def stop_process(proc, grace=5, tag=None):
     """SIGTERM the process group, SIGKILL it after the grace period."""
     if proc.poll() is not None:
         return
@@ -100,7 +121,9 @@ def stop_process(proc, grace=5):
             proc.wait(wait)
             return
         except subprocess.TimeoutExpired:
-            pass
+            if sig == signal.SIGTERM:
+                log.warning("[%s] pid %d still running %ds after SIGTERM, sending SIGKILL",
+                            tag or "?", proc.pid, grace)
 
 
 def spawn(server, tag):
@@ -215,6 +238,7 @@ class Session:
         self.version = (init_msg.get("params") or {}).get("protocolVersion")
         self.initialized = False        # client sent notifications/initialized
         self.fresh = True               # only DISCOVERY methods forwarded so far
+        self.tool_calls = 0             # tools/call requests forwarded
         self.proc = None
         self.reserved = False
         self.start_lock = threading.Lock()
@@ -227,8 +251,10 @@ class Session:
         self.get_stream = None          # queue of the open GET stream
         self.backlog = collections.deque(maxlen=1000)
         self.busy = 0
-        self.last_used = time.monotonic()
+        self.last_used = self.opened = time.monotonic()
         self.closed = threading.Event()
+        info = (init_msg.get("params") or {}).get("clientInfo") or {}
+        self.client = " ".join(str(info[k]) for k in ("name", "version") if info.get(k)) or "unknown client"
 
     def start(self):
         """Reserve an instance and start the server process (Full, OSError,
@@ -277,8 +303,8 @@ class Session:
                 msg = CLOSED
             self.forget([init["id"]])
             if msg is CLOSED or "error" in msg:
-                log.error("[%s] did not initialize: %s", self.tag, "no answer" if msg is CLOSED else msg["error"])
-                self.close()
+                self.close("server did not initialize: " + ("no answer" if msg is CLOSED else
+                                                            json.dumps(msg["error"])), logging.ERROR)
                 raise StartError("MCP server did not initialize")
             log.info("[%s] started on first use", self.tag)
             if self.initialized:
@@ -293,8 +319,11 @@ class Session:
                 continue
             self.route(msg)
         code = self.proc.wait()
-        log.info("[%s] exited with %s", self.tag, code)
-        self.close()
+        if self.closed.is_set():
+            log.info("[%s] pid %d stopped: %s", self.tag, self.proc.pid, exit_text(code))
+        else:
+            self.close(f"server process ended on its own: {exit_text(code)}",
+                       logging.INFO if code == 0 else logging.WARNING)
 
     def route(self, msg):
         with self.lock:
@@ -318,8 +347,8 @@ class Session:
             try:
                 self.proc.stdin.write(data)
                 self.proc.stdin.flush()
-            except (BrokenPipeError, ValueError, OSError):
-                self.close()
+            except (BrokenPipeError, ValueError, OSError) as e:
+                self.close(f"cannot write to the server process: {e or type(e).__name__}", logging.WARNING)
                 raise ConnectionError("server process is gone")
 
     def expect(self, ids, q):
@@ -372,10 +401,22 @@ class Session:
                 return 0
             return time.monotonic() - self.last_used
 
-    def close(self):
-        if self.closed.is_set():
-            return
-        self.closed.set()
+    def close(self, reason, level=logging.INFO):
+        """End the session (once) and stop its process; logs why."""
+        with self.lock:
+            if self.closed.is_set():
+                return
+            self.closed.set()
+        proc = self.proc
+        if proc is None:
+            what = "server never started"
+        elif proc.poll() is None:
+            what = f"stopping pid {proc.pid}"
+        else:
+            what = f"pid {proc.pid}"
+        calls = self.tool_calls
+        log.log(level, "[%s] closed: %s; open %s, %d tool call%s, %s", self.tag, reason,
+                duration(time.monotonic() - self.opened), calls, "" if calls == 1 else "s", what)
         with self.server.lock:
             self.server.sessions.pop(self.id, None)
         with self.lock:
@@ -388,7 +429,7 @@ class Session:
         for q in {id(q): q for q in queues if q is not None}.values():
             q.put(CLOSED)
         if self.proc is not None:
-            threading.Thread(target=stop_process, args=(self.proc,), daemon=True).start()
+            threading.Thread(target=stop_process, args=(self.proc, 5, self.tag), daemon=True).start()
 
 
 class Gateway:
@@ -409,8 +450,7 @@ class Gateway:
                 for s in sessions:
                     timeout = server.idle_timeout if s.proc is not None else self.lazy_idle_timeout
                     if timeout and s.idle_for() > timeout:
-                        log.info("[%s] idle for %ds, stopping", s.tag, timeout)
-                        s.close()
+                        s.close(f"idle for more than {duration(timeout)}")
 
     def counts(self):
         """server name -> (connections, processes): HTTP sessions plus TCP
@@ -486,9 +526,9 @@ class Gateway:
             with server.lock:
                 sessions = list(server.sessions.values())
             for s in sessions:
-                s.close()
+                s.close("gateway shutting down")
                 if s.proc is not None:
-                    stop_process(s.proc)
+                    stop_process(s.proc, 5, s.tag)
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -647,8 +687,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         s = self.session_of(server)
         if s is None:
             return
-        log.info("[%s] deleted by client", s.tag)
-        s.close()
+        s.close("deleted by client")
         self.reply(200)
 
     def do_POST(self):
@@ -730,7 +769,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if cached is not None:
             with server.lock:
                 server.sessions[s.id] = s
-            log.info("[%s] opened, server starts on first use", s.tag)
+            log.info("[%s] opened by %s (protocol %s), server starts on first use", s.tag, s.client, s.version)
             return self.answer({"jsonrpc": "2.0", "id": req["id"], "result": cached}, headers)
         try:
             s.start()
@@ -741,6 +780,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(502, rpc_error(-32603, f"Cannot start MCP server: {e}", req["id"]))
         with server.lock:
             server.sessions[s.id] = s
+        log.info("[%s] opened by %s (protocol %s), server started now", s.tag, s.client, s.version)
         q = queue.Queue()
         ids = [req["id"]]
         s.expect(ids, q)
@@ -750,7 +790,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (ConnectionError, queue.Empty):
             msg = CLOSED
         if msg is CLOSED or "error" in msg:
-            s.close()
+            s.close("server did not initialize: " + ("no answer" if msg is CLOSED else json.dumps(msg["error"])),
+                    logging.ERROR)
             err = msg if msg is not CLOSED else rpc_error(-32603, "MCP server did not initialize", ids[0])
             return self.reply(502 if msg is CLOSED else 200, err)
         with s.lock:
@@ -766,6 +807,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # List results of a process that has only seen discovery requests are
         # what any fresh process answers: cache those not cached yet.
         with s.lock:
+            s.tool_calls += sum(1 for m in requests if m["method"] == "tools/call")
             if any(m["method"] not in DISCOVERY for m in requests):
                 s.fresh = False
             fresh = s.fresh
@@ -858,6 +900,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
             log.error("[%s/tcp] cannot start %s: %s", server.name, server.command, e)
             return
         log.info("[%s/tcp] %s connected, pid %d", server.name, peer, proc.pid)
+        opened = time.monotonic()
         sock = self.request
 
         def upstream():
@@ -884,9 +927,12 @@ class TCPHandler(socketserver.BaseRequestHandler):
         except OSError:
             pass
         t.join(1)
-        stop_process(proc)
+        ended = proc.poll()         # None: the client disconnected first
+        stop_process(proc, 5, f"{server.name}/tcp {peer}")
         server.release()
-        log.info("[%s/tcp] %s closed, exit %s", server.name, peer, proc.returncode)
+        log.info("[%s/tcp] %s closed: %s; open %s, pid %d %s", server.name, peer,
+                 "client disconnected" if ended is None else "server process ended on its own",
+                 duration(time.monotonic() - opened), proc.pid, exit_text(proc.returncode))
 
 
 class TCPServer(QuietErrors, socketserver.ThreadingTCPServer):

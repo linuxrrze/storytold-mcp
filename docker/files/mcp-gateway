@@ -823,7 +823,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             s.leave()
 
 
-class HTTPServer(http.server.ThreadingHTTPServer):
+class QuietErrors:
+    """socketserver prints a traceback to stderr for every exception in a
+    handler -- including clients closing idle keep-alive connections with a
+    reset. Log those at debug level, anything else as an error."""
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            log.debug("%s: connection closed: %s", client_address[0], exc)
+        else:
+            log.exception("error handling a request from %s", client_address[0])
+
+
+class HTTPServer(QuietErrors, http.server.ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     address_family = socket.AF_INET6 if ":" in os.environ.get("MCP_GATEWAY_HOST", "") else socket.AF_INET
@@ -876,7 +889,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
         log.info("[%s/tcp] %s closed, exit %s", server.name, peer, proc.returncode)
 
 
-class TCPServer(socketserver.ThreadingTCPServer):
+class TCPServer(QuietErrors, socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
 

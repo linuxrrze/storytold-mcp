@@ -1,0 +1,4 @@
+# Local, site-specific copies of the committed samples (.env.sample,
+# docker-compose.yml.sample) -- never commit them.
+/.env
+/docker-compose.yml

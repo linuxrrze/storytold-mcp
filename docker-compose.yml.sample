@@ -43,7 +43,7 @@ x-mcp: &mcp
 services:
   storytold-mcp:
     <<: *mcp
-    image: git.linux-ng.de/marcel/storytold-mcp:latest
+    image: ghcr.io/linuxrrze/storytold-mcp:latest
     container_name: storytold-mcp
     # Engines start per MCP session, on its first tool call (connecting and
     # listing tools is answered from a cache): a client (claude/opencode)
@@ -52,7 +52,7 @@ services:
 
   solidcraft-mcp:
     <<: *mcp
-    image: git.linux-ng.de/marcel/solidcraft-mcp:latest
+    image: ghcr.io/linuxrrze/solidcraft-mcp:latest
     container_name: solidcraft-mcp
 
 networks:

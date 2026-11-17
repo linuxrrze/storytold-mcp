@@ -1,6 +1,6 @@
 name: storytold-mcp - check upstream versions & rebuild
 # Run title in the Actions list: scheduled/manual runs would otherwise show
-# whatever commit is latest on main. Empty (push) = Gitea's default subject.
+# whatever commit is latest on main. Empty (push) = GitHub's default (the commit subject).
 run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.event_name == 'workflow_dispatch' && 'Manual run' || '' }}
 
 on:
@@ -14,18 +14,22 @@ on:
       # Only what goes into (or gates) the image -- not the README,
       # .env.sample or the version file (CI's own bump commit would
       # otherwise trigger a second, identical rebuild).
-      - storytold-mcp/docker/**
-      - .gitea/workflows/storytold-mcp-rebuild.yml
+      - docker/**
+      - .github/workflows/build.yml
 
 env:
   STORYTOLD_REPO: https://linuxrrze.github.io/deb-repos/storytold
-  REGISTRY: git.linux-ng.de
-  IMAGE: git.linux-ng.de/marcel/storytold-mcp
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/linuxrrze/storytold-mcp
   # Sorted `<package>=<version>` lines, one per storytold app.
-  VERSION_FILE: storytold-mcp/.storytold-mcp-version
+  VERSION_FILE: .storytold-mcp-version
   # Digest of the Dockerfile's base image (ubuntu:26.04) the last build used.
-  BASE_DIGEST_FILE: storytold-mcp/.storytold-mcp-base-digest
-  ENV_FILE: storytold-mcp/.env.sample
+  BASE_DIGEST_FILE: .storytold-mcp-base-digest
+  ENV_FILE: .env.sample
+
+permissions:
+  contents: write   # "Record ..." step pushes the version/digest bump
+  packages: write   # push to ghcr.io
 
 jobs:
   check-and-build:
@@ -85,7 +89,7 @@ jobs:
         id: base
         run: |
           set -euo pipefail
-          DIGEST=$(bash .gitea/scripts/base-digest.sh storytold-mcp/docker/Dockerfile)
+          DIGEST=$(bash .github/scripts/base-digest.sh docker/Dockerfile)
           CURRENT=$(cat "$BASE_DIGEST_FILE" 2>/dev/null || echo none)
           echo "base image: current=$CURRENT latest=$DIGEST"
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
@@ -106,14 +110,15 @@ jobs:
             --build-arg STORYTOLD_PINS="${{ steps.check.outputs.pins }}" \
             -t "$IMAGE:${{ steps.check.outputs.tag }}" \
             -t "$IMAGE:latest" \
-            storytold-mcp/docker
+            --label org.opencontainers.image.source=https://github.com/linuxrrze/storytold-mcp \
+            docker
 
       # Startup banner (image name + version, figlet style) as a thin layer
-      # on top of the built image, same tags -- see .gitea/scripts/add-banner.sh.
+      # on top of the built image, same tags -- see .github/scripts/add-banner.sh.
       - name: Add startup banner
         if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
         run: |
-          bash .gitea/scripts/add-banner.sh \
+          bash .github/scripts/add-banner.sh \
             "$IMAGE:${{ steps.check.outputs.tag }}" \
             "$IMAGE:latest"
 
@@ -125,13 +130,13 @@ jobs:
         if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          bash .gitea/scripts/trivy-scan.sh "$IMAGE:latest"
+          bash .github/scripts/trivy-scan.sh "$IMAGE:latest"
 
       - name: Push image
         if: github.event_name != 'schedule' || steps.check.outputs.changed == 'true' || steps.base.outputs.changed == 'true'
         env:
-          REGISTRY_USER: ${{ secrets.REGISTRY_USER }}
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: |
           printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY" \
             -u "$REGISTRY_USER" --password-stdin
@@ -149,12 +154,12 @@ jobs:
         run: |
           printf '%s\n' ${{ steps.check.outputs.pins }} | sort > "$VERSION_FILE"
           echo "${{ steps.base.outputs.digest }}" > "$BASE_DIGEST_FILE"
-          # keep storytold-mcp/.env.sample (template for the local .env) in sync
+          # keep .env.sample (template for the local .env) in sync
           sed -i \
             -e 's/^STORYTOLD_PINS=.*/STORYTOLD_PINS="${{ steps.check.outputs.pins }}"/' \
             "$ENV_FILE"
-          git config user.email "gitea-actions@linux-ng.de"
-          git config user.name "gitea-actions"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
           git add "$VERSION_FILE" "$ENV_FILE" "$BASE_DIGEST_FILE"
           # A push-triggered rebuild with no upstream change writes identical
           # content -- only commit/push when the tracked version actually moved.

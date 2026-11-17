@@ -2,11 +2,14 @@
 
 Docker image serving the MCP servers of all
 [storytold](https://github.com/storytold) "ArtCraft" Crafting Apps over
-HTTP, built via Gitea Actions -- see
-[`.gitea/workflows/storytold-mcp-rebuild.yml`](../.gitea/workflows/storytold-mcp-rebuild.yml).
+HTTP, built via GitHub Actions and published as
+`ghcr.io/linuxrrze/storytold-mcp` -- see
+[`.github/workflows/build.yml`](.github/workflows/build.yml).
 This directory is also the **hub** of the Craft MCP stack: its compose
-sample runs this image and [`solidcraft-mcp`](../solidcraft-mcp/) next to
-[`codingenv`](../codingenv/), so claude/opencode there can use them.
+sample runs this image and
+[`solidcraft-mcp`](https://github.com/linuxrrze/solidcraft-mcp) next to
+[`codingenv`](https://git.linux-ng.de/marcel/-/packages/container/codingenv/latest) (a coding-agent container; any container on the same Docker network works the same way),
+so claude/opencode there can use them.
 
 Based on `ubuntu:26.04`, with the apps installed from the `storytold` apt
 repo of [linuxrrze/deb-repos](https://github.com/linuxrrze/deb-repos)
@@ -88,14 +91,15 @@ to be added by hand.
 | File | Used by CI? | Purpose |
 | --- | --- | --- |
 | `docker/Dockerfile` | yes | Adds the storytold repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, then probes which apps serve MCP. |
-| `docker/files/mcp-gateway` | yes | The HTTP gateway: streamable HTTP per session, idle reaper, Host/Origin checks, optional API key (`MCP_API_KEY`) and per-server raw TCP (unused here). `mcp-gateway --help` lists its options. Identical copy in `solidcraft-mcp/`. |
-| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`; then the discovery cache, see [Discovery cache](#discovery-cache)), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in `solidcraft-mcp/`. |
+| `docker/files/mcp-gateway` | yes | The HTTP gateway: streamable HTTP per session, idle reaper, Host/Origin checks, optional API key (`MCP_API_KEY`) and per-server raw TCP (unused here). `mcp-gateway --help` lists its options. Identical copy in solidcraft-mcp. |
+| `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`; then the discovery cache, see [Discovery cache](#discovery-cache)), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in solidcraft-mcp. |
 | `docker/files/app-args.conf` | yes | Per-app `mcp` flags -- mostly the automation roots confining file access to the work dir. |
-| `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-gateway. Identical copy in `solidcraft-mcp/`. |
+| `docker/files/entrypoint.sh` | yes | Checks the work dir, renders the config, execs mcp-gateway. Identical copy in solidcraft-mcp. |
 | `.storytold-mcp-version` | yes | Sorted `<package>=<version>` lines (every app) CI last built; compared against the repo index. Updated automatically by CI. |
 | `.storytold-mcp-base-digest` | yes | Registry digest of the `ubuntu:26.04` base image the last build used. Updated automatically by CI. |
 | `.env.sample` | yes (build) | Template for the local (gitignored) `.env`: `STORYTOLD_PINS` (kept in sync by CI), the stack's runtime knobs (`HOST_HOME`, `PUID`/`PGID`, `CODINGENV_NETWORK`, `MCP_LOG_LEVEL`, `MCP_ALLOWED_HOSTS`, `MCP_IDLE_TIMEOUT`, `MCP_MAX_SESSIONS`, `MCP_LAZY`, `MCP_LAZY_IDLE_TIMEOUT`, `MCP_STATS_INTERVAL`) and `TZ`. No secrets. |
 | `docker-compose.yml.sample` | no | Sanitized hub compose for storytold-mcp + solidcraft-mcp. The real file is gitignored. |
+| `.github/workflows/build.yml`, `.github/scripts/` | yes | The CI pipeline (see [Build & version tracking](#build--version-tracking)) and its helpers: base-image digest lookup, startup banner, pinned Trivy scan. |
 
 ## Usage
 
@@ -229,10 +233,9 @@ a problem.
 
 ## Build & version tracking
 
-The workflow (flavor 1 in
-[`.gitea/workflows/README.md`](../.gitea/workflows/README.md)) runs every
-3 hours (the repo index is rebuilt every 3 hours), on manual dispatch, and
-on pushes to `main` that touch `storytold-mcp/docker/**` or the workflow.
+The workflow ([`.github/workflows/build.yml`](.github/workflows/build.yml))
+runs every 3 hours (the repo index is rebuilt every 3 hours), on manual
+dispatch, and on pushes to `main` that touch `docker/**` or the workflow.
 
 - **Package versions:** downloads the repo's
   `dists/stable/main/binary-amd64/Packages` and takes the newest version of
@@ -247,8 +250,10 @@ on pushes to `main` that touch `storytold-mcp/docker/**` or the workflow.
   **fails** if an app works without its flags but not with them (an
   upstream flag change -- fix `app-args.conf`), or if no app works.
 - Build (`docker build --pull --no-cache`), startup banner
-  (`.gitea/scripts/add-banner.sh`), Trivy scan
-  (`.gitea/scripts/trivy-scan.sh`).
+  (`.github/scripts/add-banner.sh`), Trivy scan
+  (`.github/scripts/trivy-scan.sh`).
+- **Registry:** `ghcr.io/linuxrrze/storytold-mcp`, pushed with the
+  workflow's `GITHUB_TOKEN` (no secrets to set up).
 - **Tags:** 14 apps have no single version, so the version tag is the
   first 12 hex digits of the version list's sha256, plus
   `<tag>-<YYYYMMDD>` (rollback) and `latest`.

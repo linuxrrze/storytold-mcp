@@ -8,7 +8,7 @@ HTTP, built via GitHub Actions and published as
 This directory is also the **hub** of the Craft MCP stack: its compose
 sample runs this image and
 [`solidcraft-mcp`](https://github.com/linuxrrze/solidcraft-mcp) next to
-[`codingenv`](https://git.linux-ng.de/marcel/-/packages/container/codingenv/latest) (a coding-agent container; any container on the same Docker network works the same way),
+[`agent-env`](https://github.com/linuxrrze/agent-env) (a coding-agent container; any container on the same Docker network works the same way),
 so claude/opencode there can use them.
 
 Based on `ubuntu:26.04`, with the apps installed from the `storytold` apt
@@ -103,24 +103,26 @@ to be added by hand.
 
 ## Usage
 
-Start codingenv first (its network must exist), then here:
+Start agent-env first (its network must exist), then here:
 
 ```sh
 cp docker-compose.yml.sample docker-compose.yml
-cp .env.sample .env    # HOST_HOME, PUID/PGID as for codingenv; CODINGENV_NETWORK
+cp .env.sample .env    # HOST_HOME, PUID/PGID as for agent-env; CODINGENV_NETWORK
 mkdir -p "$HOST_HOME/work"
 docker compose up -d
 ```
 
-- **Network:** both services join codingenv's compose network
-  (`CODINGENV_NETWORK`, default `codingenv_default` -- check with
-  `docker network ls`) as an external network, so codingenv's own compose
+- **Network:** both services join agent-env's compose network
+  (`CODINGENV_NETWORK`, default `agent-env_default`; the variable kept
+  its pre-rename name, and a host whose agent-env compose file is still in
+  a `codingenv/` directory has `codingenv_default` -- check with
+  `docker network ls`) as an external network, so agent-env's own compose
   file needs no change. **No ports are published**: without `MCP_API_KEY`
   the gateway has no authentication, anything on that network can use the
   servers. The
   sample has a commented `127.0.0.1:8081` mapping for testing from the host.
 - **Shared work dir:** `$HOST_HOME/work` is mounted at
-  `/home/sandbox/work` -- the path it already has inside codingenv
+  `/home/sandbox/work` -- the path it already has inside agent-env
   (Option A mounts `HOST_HOME` at `/home/sandbox`), so a path the agent
   hands to a tool means the same file everywhere. The servers run with it
   as their cwd, and every app with automation-root flags (see
@@ -131,7 +133,7 @@ docker compose up -d
   list): it has no work-dir confinement flag, and its `rebuild_*` tools
   start a coding agent (needs an AI backend via `craft-anything-cli ai
   ...`).
-- **User:** the containers run as `PUID:PGID` (codingenv's), so files they
+- **User:** the containers run as `PUID:PGID` (agent-env's), so files they
   write into the work dir are yours. The entrypoint aborts if the work dir
   is missing or not writable for that uid.
 - **Resources:** nothing runs until a tool is called. claude and opencode
@@ -148,7 +150,7 @@ docker compose up -d
   Sessions share the work dir, so two clients saving the same file name
   overwrite each other (last save wins).
 
-### Connecting claude / opencode in codingenv
+### Connecting claude / opencode in agent-env
 
 Print ready-made config for everything this image serves:
 
@@ -158,7 +160,7 @@ docker compose exec storytold-mcp mcp-servers client-config opencode  # opencode
 docker compose exec solidcraft-mcp mcp-servers client-config claude
 ```
 
-or add single servers by hand inside codingenv:
+or add single servers by hand inside agent-env:
 
 ```sh
 claude mcp add --transport http pdfcraft http://storytold-mcp:8080/servers/pdfcraft/mcp

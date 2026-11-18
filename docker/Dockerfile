@@ -62,7 +62,7 @@ done > /etc/mcp-gateway/versions.txt
 
 rm -rf /var/lib/apt/lists/*
 
-# Runs under an arbitrary compose `user:` (the codingenv PUID) -- give it a
+# Runs under an arbitrary compose `user:` (the agent-env PUID) -- give it a
 # writable HOME for the apps' config/autosave dirs.
 mkdir -p /home/mcp
 chmod 1777 /home/mcp

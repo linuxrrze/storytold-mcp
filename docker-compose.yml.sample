@@ -1,30 +1,30 @@
-# Craft MCP servers next to codingenv: storytold-mcp (all ArtCraft apps) and
+# Craft MCP servers next to agent-env: storytold-mcp (all ArtCraft apps) and
 # solidcraft-mcp, each serving its stdio MCP servers over HTTP (one server
 # process per MCP session, started on demand) at
 #   http://storytold-mcp:8080/servers/<app>/mcp
 #   http://solidcraft-mcp:8080/servers/solidcraft/mcp
-# Both join codingenv's network, so start codingenv first, then:
+# Both join agent-env's network, so start agent-env first, then:
 #   cp docker-compose.yml.sample docker-compose.yml
 #   cp .env.sample .env        # set HOST_HOME, PUID/PGID, CODINGENV_NETWORK
 #   docker compose up -d
-# Client config for claude/opencode in codingenv:
+# Client config for claude/opencode in agent-env:
 #   docker compose exec storytold-mcp mcp-servers client-config claude
 #
 # No ports are published: mcp-gateway runs without authentication here, so
-# the servers are only reachable from containers on codingenv's network.
+# the servers are only reachable from containers on agent-env's network.
 
 x-mcp: &mcp
   restart: unless-stopped
   # .env must exist locally: cp .env.sample .env
   env_file: .env
-  # codingenv's PUID/PGID: files written into the work dir belong to you.
+  # agent-env's PUID/PGID: files written into the work dir belong to you.
   user: "${PUID:-1000}:${PGID:-1000}"
   volumes:
     - /etc/localtime:/etc/localtime:ro
-    # The shared work dir, at the SAME path as inside codingenv (whose
+    # The shared work dir, at the SAME path as inside agent-env (whose
     # Option A mounts HOST_HOME at /home/sandbox): a path the agent passes
     # to a tool means the same file in every container. All servers are
-    # confined to it (see docker/files/app-args.conf). With codingenv's
+    # confined to it (see docker/files/app-args.conf). With agent-env's
     # Option B, mount the same host dir at /home/sandbox/work there too.
     - ${HOST_HOME:-/home/YOURUSER}/work:/home/sandbox/work
   # Scratch (headless renders, the rendered server config), RAM-backed and
@@ -35,7 +35,7 @@ x-mcp: &mcp
   tmpfs:
     - /tmp:size=10g
   networks:
-    - codingenv
+    - agent-env
   # Uncomment to test from the host (e.g. MCP Inspector) -- localhost only.
   # ports:
   #   - "127.0.0.1:8081:8080"
@@ -56,6 +56,6 @@ services:
     container_name: solidcraft-mcp
 
 networks:
-  codingenv:
+  agent-env:
     external: true
-    name: ${CODINGENV_NETWORK:-codingenv_default}
+    name: ${CODINGENV_NETWORK:-agent-env_default}

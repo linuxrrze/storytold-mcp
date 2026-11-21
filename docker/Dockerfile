@@ -40,23 +40,50 @@ fi
 # client libs (some only Recommended) and render offscreen via Mesa's CPU
 # Vulkan (lavapipe in mesa-vulkan-drivers) -- install those explicitly
 # instead of all Recommends (xdg-desktop-portal, cups, pipewire, ...).
+# The .debs are kept in their own dir until the checks below are done
+# (ubuntu's docker-clean hook empties /var/cache/apt/archives after every
+# install). apt names each one after its index entry: <pkg>_<version>_<arch>.deb.
+DEBS=/var/cache/apt/storytold
+mkdir -p "$DEBS/partial"
 # shellcheck disable=SC2086
-apt install -y $PINS --no-install-recommends \
+apt install -y $PINS --no-install-recommends -o Dir::Cache::Archives="$DEBS/" \
 	mesa-vulkan-drivers libegl-mesa0 libwayland-client0 libx11-6 libx11-xcb1 \
 	libxcursor1 libxi6 libxrandr2 fonts-dejavu-core
 
-# Make sure every pinned version is what got installed
+# What an index package got installed as: `<package>=<version>`. Normally its
+# own name, but the index and the .deb can disagree -- e.g. the index's
+# artcraft 0.41.1-1 is a .deb with Package: art-craft, Version: 0.41.1 --
+# then dpkg only knows the .deb's name, so read that from the .deb.
+installed_as() {
+	if dpkg-query -W -f='${Package}=${Version}\n' "$1" 2>/dev/null; then
+		return
+	fi
+	set -- "$1" "$DEBS/$1"_*.deb
+	[ $# = 2 ] && [ -f "$2" ] || { echo "no installed package or .deb for $1" >&2; return 1; }
+	set -- "$1" "$(dpkg-deb -f "$2" Package)"
+	echo "WARNING: index package $1 is installed as $2" >&2
+	dpkg-query -W -f='${Package}=${Version}\n' "$2"
+}
+
+# Make sure every pinned version is what got installed (for a renamed .deb:
+# the pinned version minus its Debian revision, as the .deb drops it too)
 for pin in $STORYTOLD_PINS; do
-	dpkg-query -W -f='${Version}\n' "${pin%%=*}" | grep -qxF "${pin#*=}"
+	got=$(installed_as "${pin%%=*}")
+	if [ "${got%%=*}" = "${pin%%=*}" ]; then
+		[ "$got" = "$pin" ]
+	else
+		want=${pin#*=}
+		[ "${got#*=}" = "$want" ] || [ "${got#*=}" = "${want%-*}" ]
+	fi || { echo "pinned $pin, installed $got" >&2; exit 1; }
 done
 # Installed app versions, for `docker run ... cat`.
 # Package names, not a '*craft' glob: an app isn't bound to be named *craft.
 mkdir -p /etc/mcp-gateway
 for pin in $PINS; do
-	dpkg-query -W -f='${Package}=${Version}\n' "${pin%%=*}"
+	installed_as "${pin%%=*}"
 done > /etc/mcp-gateway/versions.txt
 
-rm -rf /var/lib/apt/lists/*
+rm -rf /var/lib/apt/lists/* "$DEBS"
 
 # Runs under an arbitrary compose `user:` (the agent-env PUID) -- give it a
 # writable HOME for the apps' config/autosave dirs.

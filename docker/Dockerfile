@@ -5,7 +5,8 @@ FROM ubuntu:26.04
 ARG STORYTOLD_PINS
 ENV UBUNTU_VERSION=26.04
 
-ENV DEB_REPO=https://linuxrrze.github.io/deb-repos
+# Official ArtCraft APT repository, see https://getartcraft.com/linux
+ENV ARTCRAFT_URL=https://getartcraft.com
 
 RUN << EORUN
 set -e
@@ -19,18 +20,13 @@ set -e
 apt update && apt -y dist-upgrade
 apt install -y ca-certificates curl python3 tini --no-install-recommends
 
-# Add the storytold repo. mirror+https: apt reads the indexes from github.io
-# and fetches the .debs straight from the apps' GitHub release assets.
-mkdir -p /etc/apt/keyrings
-curl -fsSL "$DEB_REPO/deb-repos.asc" -o /etc/apt/keyrings/deb-repos.asc
-cat > /etc/apt/sources.list.d/storytold.sources << EOF
-Types: deb
-URIs: mirror+$DEB_REPO/storytold/mirrors.txt
-Suites: stable
-Components: main
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/deb-repos.asc
-EOF
+# Add the official ArtCraft repo (signing key fingerprint
+# 2B76741B414AAD6CD33E631213A005C0B9D7C3ED). apt verifies the signed
+# InRelease; the .debs are served from the apps' GitHub release assets.
+install -d -m 755 /etc/apt/keyrings
+curl -fsSL "$ARTCRAFT_URL/keys/artcraft.gpg" -o /etc/apt/keyrings/artcraft.gpg
+chmod 644 /etc/apt/keyrings/artcraft.gpg
+curl -fsSL "$ARTCRAFT_URL/apt/artcraft.sources" -o /etc/apt/sources.list.d/artcraft.sources
 apt update
 
 PINS="$STORYTOLD_PINS"
@@ -38,7 +34,7 @@ if [ -z "$PINS" ]; then
 	# Every app in the repo; artcraft-launcher is a GUI-only installer,
 	# craft-anything is excluded for now (same list as the workflow's).
 	PINS=$(awk '/^Package:/ && $2 != "artcraft-launcher" && $2 != "craft-anything" { print $2 }' \
-		/var/lib/apt/lists/*storytold*_Packages | sort -u)
+		/var/lib/apt/lists/*getartcraft.com_apt_*_Packages | sort -u)
 fi
 # Headless MCP needs no display, but the apps link the X11/Wayland/Vulkan
 # client libs (some only Recommended) and render offscreen via Mesa's CPU

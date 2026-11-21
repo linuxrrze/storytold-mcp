@@ -11,8 +11,8 @@ sample runs this image and
 [`agent-env`](https://github.com/linuxrrze/agent-env) (a coding-agent container; any container on the same Docker network works the same way),
 so claude/opencode there can use them.
 
-Based on `ubuntu:26.04`, with the apps installed from the `storytold` apt
-repo of [linuxrrze/deb-repos](https://github.com/linuxrrze/deb-repos)
+Based on `ubuntu:26.04`, with the apps installed from the official
+[ArtCraft apt repository](https://getartcraft.com/linux)
 (every app except `artcraft-launcher`, the GUI installer, and -- for now --
 `craft-anything`, see below). Each app package
 ships `<app>-cli`, whose `<app>-cli mcp` is a headless MCP server -- **stdio
@@ -90,7 +90,7 @@ to be added by hand.
 
 | File | Used by CI? | Purpose |
 | --- | --- | --- |
-| `docker/Dockerfile` | yes | Adds the storytold repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, then probes which apps serve MCP. |
+| `docker/Dockerfile` | yes | Adds the official ArtCraft apt repo, installs the apps (`ARG STORYTOLD_PINS`: space-separated `pkg=version` apt pins; empty installs every app in the repo) plus the Mesa/X11 libs headless rendering needs, then probes which apps serve MCP. |
 | `docker/files/mcp-gateway` | yes | The HTTP gateway: streamable HTTP per session, idle reaper, Host/Origin checks, optional API key (`MCP_API_KEY`) and per-server raw TCP (unused here). `mcp-gateway --help` lists its options. Identical copy in solidcraft-mcp. |
 | `docker/files/mcp-servers` | yes | `detect` (build: probe every `<app>-cli mcp` with an MCP `initialize`, write `/etc/mcp-gateway/apps.list`; then the discovery cache, see [Discovery cache](#discovery-cache)), `render` (start: write mcp-gateway's server config for the current `WORK_DIR`), `client-config [claude\|opencode]` (print client config). Identical copy in solidcraft-mcp. |
 | `docker/files/app-args.conf` | yes | Per-app `mcp` flags -- mostly the automation roots confining file access to the work dir. |

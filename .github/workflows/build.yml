@@ -5,7 +5,7 @@ run-name: ${{ github.event_name == 'schedule' && 'Scheduled check' || github.eve
 
 on:
   schedule:
-    # every 3 hours -- the deb-repos index itself is rebuilt every 3 hours
+    # every 3 hours -- poll the official ArtCraft apt index for new releases
     - cron: '30 */3 * * *'
   workflow_dispatch: {}
   push:
@@ -18,7 +18,7 @@ on:
       - .github/workflows/build.yml
 
 env:
-  STORYTOLD_REPO: https://linuxrrze.github.io/deb-repos/storytold
+  STORYTOLD_REPO: https://getartcraft.com/apt
   REGISTRY: ghcr.io
   IMAGE: ghcr.io/linuxrrze/storytold-mcp
   # Sorted `<package>=<version>` lines, one per storytold app.

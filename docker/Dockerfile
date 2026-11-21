@@ -43,10 +43,12 @@ fi
 # The .debs are kept in their own dir until the checks below are done
 # (ubuntu's docker-clean hook empties /var/cache/apt/archives after every
 # install). apt names each one after its index entry: <pkg>_<version>_<arch>.deb.
+# apt-get, not apt: apt deletes the .debs right after installing them.
 DEBS=/var/cache/apt/storytold
 mkdir -p "$DEBS/partial"
 # shellcheck disable=SC2086
-apt install -y $PINS --no-install-recommends -o Dir::Cache::Archives="$DEBS/" \
+apt-get install -y $PINS --no-install-recommends \
+	-o Dir::Cache::Archives="$DEBS/" -o APT::Keep-Downloaded-Packages=true \
 	mesa-vulkan-drivers libegl-mesa0 libwayland-client0 libx11-6 libx11-xcb1 \
 	libxcursor1 libxi6 libxrandr2 fonts-dejavu-core
 

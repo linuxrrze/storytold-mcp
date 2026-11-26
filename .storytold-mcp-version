@@ -1,7 +1,7 @@
 anicraft=0.2.1-1
 artcraft=0.41.1-1
 cadcraft=0.20.1-1
-deckcraft=0.18.1-1
+deckcraft=0.19.1-1
 designcraft=0.21.1-1
 effectcraft=0.25.1-1
 figcraft=0.18.1-1
@@ -14,4 +14,4 @@ photocraft=0.23.1-1
 soundcraft=0.20.1-1
 texturecraft=0.6.1-1
 vectorcraft=0.24.1-1
-wordcraft=0.18.1-1
+wordcraft=0.19.1-1
